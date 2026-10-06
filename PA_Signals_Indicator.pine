@@ -1,0 +1,317 @@
+//@version=6
+// =============================================================================
+//  PRICE ACTION SIGNALS  [S/R zones + Higher-Timeframe Trend]  —  INDICATOR
+// -----------------------------------------------------------------------------
+//  WHAT IT DOES
+//   • Finds bullish/bearish ENGULFING, PIN BAR and INSIDE BAR candles.
+//   • Draws support/resistance zones from recent swing highs and lows.
+//   • Gives a BUY only when a bullish pattern forms AT SUPPORT while the
+//     higher-timeframe trend (price vs 50 EMA) is UP. SELL is the mirror image.
+//   • Stop-loss goes just beyond the pattern's wick; take-profit is set at a
+//     risk:reward of at least 1:2.
+//
+//  WHAT IT DOES NOT DO
+//   • It NEVER places trades. It only draws signals and fires alerts.
+//     You decide and place every trade yourself.
+//
+//  NO REPAINTING
+//   • Signals are only confirmed when the candle CLOSES.
+//   • The trend uses the last CLOSED higher-timeframe candle.
+//   • Swing zones appear a few bars after the swing (they need "Swing lookback"
+//     bars on the right side to be confirmed). This is normal.
+// =============================================================================
+indicator("Price Action Signals [S/R + HTF Trend]", shorttitle = "PA Signals", overlay = true,
+     max_labels_count = 500, max_lines_count = 500, max_boxes_count = 500)
+
+// =============================================================================
+//  1. SETTINGS (all adjustable from the indicator's gear icon)
+// =============================================================================
+const string GRP_TREND = "1) Trend filter"
+const string GRP_SR    = "2) Support / Resistance zones"
+const string GRP_PAT   = "3) Candlestick patterns"
+const string GRP_RISK  = "4) Stop-loss / Take-profit"
+const string GRP_VIS   = "5) Display"
+
+// --- Trend filter ---
+emaLen  = input.int(50, "EMA length", minval = 1, group = GRP_TREND)
+trendTF = input.timeframe("240", "Trend timeframe", group = GRP_TREND,
+     tooltip = "Timeframe used for the trend filter. 240 = 4 hours. Must be HIGHER than your chart timeframe.")
+
+// --- Support / Resistance ---
+swingLen = input.int(10, "Swing lookback (bars each side)", minval = 2, group = GRP_SR,
+     tooltip = "A swing high/low must be the highest/lowest candle with this many bars on BOTH sides. Bigger = fewer, stronger zones.")
+maxZones = input.int(3, "Zones to keep (each side)", minval = 1, maxval = 20, group = GRP_SR)
+zoneMult = input.float(0.5, "Zone thickness (x ATR)", minval = 0.05, step = 0.05, group = GRP_SR,
+     tooltip = "How thick each zone is, as a multiple of the 14-bar Average True Range.")
+
+// --- Patterns (on/off toggles) ---
+useEngulf = input.bool(true, "Engulfing", group = GRP_PAT)
+usePin    = input.bool(true, "Pin bar", group = GRP_PAT)
+useInside = input.bool(true, "Inside bar", group = GRP_PAT)
+pinRatio  = input.float(2.0, "Pin bar: min wick / body ratio", minval = 1.0, step = 0.5, group = GRP_PAT)
+pinNose   = input.float(60, "Pin bar: min wick % of candle", minval = 50, maxval = 95, group = GRP_PAT)
+
+// --- Risk ---
+rrRatio  = input.float(2.0, "Risk : Reward (TP = risk x this)", minval = 2.0, step = 0.5, group = GRP_RISK,
+     tooltip = "2 means the take-profit is twice as far as the stop-loss (1:2). Minimum is 2.")
+slPips   = input.float(2.0, "SL buffer beyond wick (pips)", minval = 0, step = 0.5, group = GRP_RISK)
+pipOverride = input.float(0, "Pip size override (0 = auto)", minval = 0, step = 0.0001, group = GRP_RISK,
+     tooltip = "Leave at 0. Auto uses 0.0001 for forex pairs and 0.01 for JPY pairs. The table shows the pip size in use.")
+cooldown = input.int(3, "Min bars between signals", minval = 0, group = GRP_RISK,
+     tooltip = "Stops a cluster of signals appearing on back-to-back candles.")
+
+// --- Display ---
+showZones  = input.bool(true, "Show S/R zones", group = GRP_VIS)
+showEma    = input.bool(true, "Show trend EMA", group = GRP_VIS)
+showLabels = input.bool(true, "Show BUY/SELL labels", group = GRP_VIS)
+showLines  = input.bool(true, "Show SL/TP lines", group = GRP_VIS)
+lineLen    = input.int(20, "SL/TP line length (bars)", minval = 1, maxval = 500, group = GRP_VIS)
+showTable  = input.bool(true, "Show info table", group = GRP_VIS)
+
+// =============================================================================
+//  2. HELPERS
+// =============================================================================
+// One pip, in price. A pip is a fixed size no matter how many decimals the data feed
+// shows (some feeds quote GBPUSD as 1.34805, others as 1.3480), so it must NOT be
+// derived from the tick size:
+//   • JPY-quoted pairs (USDJPY, GBPJPY ...): 1 pip = 0.01
+//   • all other forex pairs:                 1 pip = 0.0001
+//   • non-forex (gold, indices ...):          1 pip = 10 ticks (rough convention)
+// Use "Pip size override" if your symbol needs something else.
+f_pipSize() =>
+    syminfo.type == "forex" ? (syminfo.currency == "JPY" ? 0.01 : 0.0001) : syminfo.mintick * 10
+pip = pipOverride > 0 ? pipOverride : f_pipSize()
+
+// Format a price with the symbol's normal number of decimals.
+f_fmt(float x) => str.tostring(x, format.mintick)
+
+// Turn a timeframe string like "240" into a readable "4H".
+f_tfLabel(string tf) =>
+    float mins = timeframe.in_seconds(tf) / 60
+    str.endswith(tf, "M") ? tf : mins >= 10080 ? str.tostring(mins / 10080, "#.##") + "W" : mins >= 1440 ? str.tostring(mins / 1440, "#.##") + "D" : mins >= 60 ? str.tostring(mins / 60, "#.##") + "H" : str.tostring(mins, "#.##") + "m"
+
+// Build a readable list of the patterns that fired, e.g. "Engulfing + Pin Bar".
+f_names(bool e, bool p, bool i) =>
+    string s = ""
+    if e
+        s += "Engulfing"
+    if p
+        s += (s == "" ? "" : " + ") + "Pin Bar"
+    if i
+        s += (s == "" ? "" : " + ") + "Inside Bar"
+    s
+
+// =============================================================================
+//  3. HIGHER-TIMEFRAME TREND (default 4H, 50 EMA)
+// =============================================================================
+// [1] + lookahead_on = use the last CLOSED higher-timeframe candle -> no repainting.
+[htfClose, htfEma] = request.security(syminfo.tickerid, trendTF, [close[1], ta.ema(close, emaLen)[1]], lookahead = barmerge.lookahead_on)
+trendUp   = htfClose > htfEma
+trendDown = htfClose < htfEma
+badTF     = timeframe.in_seconds(trendTF) < timeframe.in_seconds(timeframe.period)
+
+// =============================================================================
+//  4. SUPPORT / RESISTANCE ZONES FROM SWING HIGHS / LOWS
+// =============================================================================
+atr   = ta.atr(14)
+ph    = ta.pivothigh(high, swingLen, swingLen)   // swing high (confirmed swingLen bars later)
+pl    = ta.pivotlow(low, swingLen, swingLen)     // swing low
+zoneH = atr[swingLen] * zoneMult                 // zone thickness measured at the swing bar
+
+// Zones are stored as boxes. If "Show S/R zones" is off they are invisible but still used.
+resBg  = color.new(color.red, showZones ? 85 : 100)
+resBd  = color.new(color.red, showZones ? 50 : 100)
+supBg  = color.new(color.green, showZones ? 85 : 100)
+supBd  = color.new(color.green, showZones ? 50 : 100)
+
+var array<box> resZones = array.new<box>()
+var array<box> supZones = array.new<box>()
+
+// New resistance zone: from the swing high down by the zone thickness.
+if not na(ph)
+    resZones.push(box.new(bar_index - swingLen, ph, bar_index, ph - zoneH, border_color = resBd, bgcolor = resBg, extend = extend.right))
+    if resZones.size() > maxZones
+        resZones.shift().delete()   // remove the oldest zone
+
+// New support zone: from the swing low up by the zone thickness.
+if not na(pl)
+    supZones.push(box.new(bar_index - swingLen, pl + zoneH, bar_index, pl, border_color = supBd, bgcolor = supBg, extend = extend.right))
+    if supZones.size() > maxZones
+        supZones.shift().delete()
+
+// Did the bullish pattern's low reach a support zone, and did price close back above it?
+f_atSupport(float patLow) =>
+    bool hit = false
+    for z in supZones
+        if patLow <= z.get_top() and close >= z.get_bottom()
+            hit := true
+    hit
+
+// Did the bearish pattern's high reach a resistance zone, and did price close back below it?
+f_atResistance(float patHigh) =>
+    bool hit = false
+    for z in resZones
+        if patHigh >= z.get_bottom() and close <= z.get_top()
+            hit := true
+    hit
+
+// =============================================================================
+//  5. CANDLESTICK PATTERNS
+// =============================================================================
+body     = math.abs(close - open)
+rng      = high - low
+upWick   = high - math.max(open, close)
+dnWick   = math.min(open, close) - low
+prevBody = math.abs(close[1] - open[1])
+
+// Engulfing: this candle's body completely covers the previous opposite-colour body.
+bullEngulf = useEngulf and close > open and close[1] < open[1] and close >= open[1] and open <= close[1] and body > prevBody
+bearEngulf = useEngulf and close < open and close[1] > open[1] and close <= open[1] and open >= close[1] and body > prevBody
+
+// Pin bar: long "nose" wick rejecting a level, small body at the other end.
+bullPin = usePin and rng > 0 and dnWick >= pinRatio * body and dnWick >= rng * pinNose / 100 and upWick <= rng * 0.25
+bearPin = usePin and rng > 0 and upWick >= pinRatio * body and upWick >= rng * pinNose / 100 and dnWick <= rng * 0.25
+
+// Inside bar: whole candle sits inside the previous ("mother") candle.
+// Its colour gives the direction: green inside bar = bullish, red = bearish.
+isInside   = high < high[1] and low > low[1]
+bullInside = useInside and isInside and close > open
+bearInside = useInside and isInside and close < open
+
+bullPattern = bullEngulf or bullPin or bullInside
+bearPattern = bearEngulf or bearPin or bearInside
+
+// The pattern's extreme wick. Two-candle patterns (engulfing, inside bar) use both candles.
+bullPatLow  = (bullEngulf or bullInside) ? math.min(low, low[1]) : low
+bearPatHigh = (bearEngulf or bearInside) ? math.max(high, high[1]) : high
+
+// =============================================================================
+//  6. ENTRY / STOP-LOSS / TAKE-PROFIT
+// =============================================================================
+buyEntry  = close
+buySL     = bullPatLow - slPips * pip                 // below the pattern's lowest wick
+buyTP     = buyEntry + (buyEntry - buySL) * rrRatio   // risk x R:R above entry
+
+sellEntry = close
+sellSL    = bearPatHigh + slPips * pip                // above the pattern's highest wick
+sellTP    = sellEntry - (sellSL - sellEntry) * rrRatio
+
+// =============================================================================
+//  7. SIGNALS  =  pattern  +  at S/R zone  +  with HTF trend  +  candle closed
+// =============================================================================
+atSupport    = f_atSupport(bullPatLow)
+atResistance = f_atResistance(bearPatHigh)
+
+var int lastSigBar = na
+cooldownOk = na(lastSigBar) or bar_index - lastSigBar > cooldown
+
+buySignal  = barstate.isconfirmed and cooldownOk and trendUp and bullPattern and atSupport and buyEntry > buySL
+sellSignal = barstate.isconfirmed and cooldownOk and trendDown and bearPattern and atResistance and sellEntry < sellSL
+
+// Remove zones that price has CLOSED through - a broken support is no longer support.
+if supZones.size() > 0
+    for i = supZones.size() - 1 to 0
+        if close < supZones.get(i).get_bottom()
+            supZones.remove(i).delete()
+if resZones.size() > 0
+    for i = resZones.size() - 1 to 0
+        if close > resZones.get(i).get_top()
+            resZones.remove(i).delete()
+
+// Remember the latest signal for the info table.
+var string lastDir   = "None yet"
+var string lastPat   = ""
+var float  lastEntry = na
+var float  lastSL    = na
+var float  lastTP    = na
+var int    lastTime  = na
+
+// =============================================================================
+//  8. DRAW LABELS + SL/TP LINES
+// =============================================================================
+if buySignal
+    names = f_names(bullEngulf, bullPin, bullInside)
+    lastSigBar := bar_index
+    lastDir    := "BUY"
+    lastPat    := names
+    lastEntry  := buyEntry
+    lastSL     := buySL
+    lastTP     := buyTP
+    lastTime   := time
+    if showLabels
+        label.new(bar_index, low, "BUY  (" + names + ")\nEntry: " + f_fmt(buyEntry) + "\nSL: " + f_fmt(buySL) + "\nTP: " + f_fmt(buyTP) + "\nRisk: " + str.tostring((buyEntry - buySL) / pip, "#.#") + " pips", yloc = yloc.belowbar, style = label.style_label_up, color = color.new(color.green, 0), textcolor = color.white, size = size.small)
+    if showLines
+        line.new(bar_index, buySL, bar_index + lineLen, buySL, color = color.red, width = 2)
+        line.new(bar_index, buyTP, bar_index + lineLen, buyTP, color = color.green, width = 2)
+        line.new(bar_index, buyEntry, bar_index + lineLen, buyEntry, color = color.gray, style = line.style_dotted)
+
+if sellSignal
+    names = f_names(bearEngulf, bearPin, bearInside)
+    lastSigBar := bar_index
+    lastDir    := "SELL"
+    lastPat    := names
+    lastEntry  := sellEntry
+    lastSL     := sellSL
+    lastTP     := sellTP
+    lastTime   := time
+    if showLabels
+        label.new(bar_index, high, "SELL  (" + names + ")\nEntry: " + f_fmt(sellEntry) + "\nSL: " + f_fmt(sellSL) + "\nTP: " + f_fmt(sellTP) + "\nRisk: " + str.tostring((sellSL - sellEntry) / pip, "#.#") + " pips", yloc = yloc.abovebar, style = label.style_label_down, color = color.new(color.red, 0), textcolor = color.white, size = size.small)
+    if showLines
+        line.new(bar_index, sellSL, bar_index + lineLen, sellSL, color = color.red, width = 2)
+        line.new(bar_index, sellTP, bar_index + lineLen, sellTP, color = color.green, width = 2)
+        line.new(bar_index, sellEntry, bar_index + lineLen, sellEntry, color = color.gray, style = line.style_dotted)
+
+// Small arrows if labels are turned off.
+plotshape(buySignal and not showLabels, "Buy arrow", shape.triangleup, location.belowbar, color.green, size = size.small)
+plotshape(sellSignal and not showLabels, "Sell arrow", shape.triangledown, location.abovebar, color.red, size = size.small)
+
+// Higher-timeframe EMA (green = uptrend, red = downtrend).
+plot(showEma ? htfEma : na, "Trend EMA", color = trendUp ? color.green : color.red, linewidth = 2, style = plot.style_stepline)
+
+// =============================================================================
+//  9. INFO TABLE (top-right corner)
+// =============================================================================
+var table info = table.new(position.top_right, 2, 7, bgcolor = color.new(color.black, 25), border_width = 1, border_color = color.new(color.gray, 50))
+
+if showTable and barstate.islast
+    trendTxt = badTF ? "⚠ Trend TF must be higher than chart" : trendUp ? "BULLISH ▲" : trendDown ? "BEARISH ▼" : "NEUTRAL"
+    trendCol = badTF ? color.orange : trendUp ? color.lime : trendDown ? color.red : color.gray
+    sigCol   = lastDir == "BUY" ? color.lime : lastDir == "SELL" ? color.red : color.gray
+    info.cell(0, 0, "PA Signals", text_color = color.white, text_size = size.small, text_halign = text.align_left)
+    info.cell(1, 0, syminfo.ticker + " · " + f_tfLabel(timeframe.period), text_color = color.white, text_size = size.small)
+    info.cell(0, 1, "Trend (" + f_tfLabel(trendTF) + ")", text_color = color.white, text_size = size.small, text_halign = text.align_left)
+    info.cell(1, 1, trendTxt, text_color = trendCol, text_size = size.small)
+    info.cell(0, 2, "Last signal", text_color = color.white, text_size = size.small, text_halign = text.align_left)
+    info.cell(1, 2, lastDir + (lastPat == "" ? "" : " · " + lastPat), text_color = sigCol, text_size = size.small)
+    info.cell(0, 3, "Entry", text_color = color.white, text_size = size.small, text_halign = text.align_left)
+    info.cell(1, 3, na(lastEntry) ? "-" : f_fmt(lastEntry), text_color = color.white, text_size = size.small)
+    info.cell(0, 4, "SL / TP", text_color = color.white, text_size = size.small, text_halign = text.align_left)
+    info.cell(1, 4, na(lastSL) ? "-" : f_fmt(lastSL) + " / " + f_fmt(lastTP), text_color = color.white, text_size = size.small)
+    info.cell(0, 5, "Time", text_color = color.white, text_size = size.small, text_halign = text.align_left)
+    info.cell(1, 5, na(lastTime) ? "-" : str.format_time(lastTime, "dd MMM yyyy HH:mm", syminfo.timezone), text_color = color.white, text_size = size.small)
+    info.cell(0, 6, "Pip size", text_color = color.white, text_size = size.small, text_halign = text.align_left)
+    info.cell(1, 6, str.tostring(pip), text_color = color.white, text_size = size.small)
+
+// =============================================================================
+//  10. ALERTS
+// =============================================================================
+// Hidden plots so alert messages can include the prices (see {{plot("...")}} below).
+// They only appear in the Data Window, not on the chart.
+plot(buySignal ? buyEntry : na, "Buy Entry", display = display.data_window, editable = false)
+plot(buySignal ? buySL : na, "Buy SL", display = display.data_window, editable = false)
+plot(buySignal ? buyTP : na, "Buy TP", display = display.data_window, editable = false)
+plot(sellSignal ? sellEntry : na, "Sell Entry", display = display.data_window, editable = false)
+plot(sellSignal ? sellSL : na, "Sell SL", display = display.data_window, editable = false)
+plot(sellSignal ? sellTP : na, "Sell TP", display = display.data_window, editable = false)
+
+// Option A: pick "BUY signal" or "SELL signal" in the Create Alert window.
+// {{ticker}} = pair, {{interval}} = chart timeframe in minutes (15, 60 ...).
+alertcondition(buySignal, "BUY signal", 'BUY {{ticker}} ({{interval}}) | Entry: {{plot("Buy Entry")}} | SL: {{plot("Buy SL")}} | TP: {{plot("Buy TP")}}')
+alertcondition(sellSignal, "SELL signal", 'SELL {{ticker}} ({{interval}}) | Entry: {{plot("Sell Entry")}} | SL: {{plot("Sell SL")}} | TP: {{plot("Sell TP")}}')
+
+// Option B: pick "Any alert() function call" for ONE alert that covers both
+// directions, with neatly rounded prices and the pattern name.
+if buySignal
+    alert("BUY " + syminfo.ticker + " (" + f_tfLabel(timeframe.period) + ") " + f_names(bullEngulf, bullPin, bullInside) + " | Entry: " + f_fmt(buyEntry) + " | SL: " + f_fmt(buySL) + " | TP: " + f_fmt(buyTP), alert.freq_once_per_bar_close)
+if sellSignal
+    alert("SELL " + syminfo.ticker + " (" + f_tfLabel(timeframe.period) + ") " + f_names(bearEngulf, bearPin, bearInside) + " | Entry: " + f_fmt(sellEntry) + " | SL: " + f_fmt(sellSL) + " | TP: " + f_fmt(sellTP), alert.freq_once_per_bar_close)

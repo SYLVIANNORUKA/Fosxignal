@@ -1,0 +1,266 @@
+//@version=6
+// =============================================================================
+//  PRICE ACTION SIGNALS  [S/R zones + Higher-Timeframe Trend]  —  STRATEGY
+// -----------------------------------------------------------------------------
+//  BACKTEST VERSION of the "PA Signals" indicator. Same signal logic, but it
+//  simulates trades so you can see results in TradingView's Strategy Tester.
+//
+//  • Risks a fixed % of equity per trade (default 1%).
+//    Position size = (equity x risk %) / (distance to stop-loss in money).
+//  • Enters at the close of the signal candle (same price the indicator shows).
+//  • Exits ONLY at the stop-loss or take-profit.
+//  • One trade at a time: new signals are ignored while a trade is open.
+//
+//  This is a SIMULATION for testing. It cannot place real trades and is not
+//  connected to any broker unless you connect one yourself (don't, if you want
+//  to trade manually).
+// =============================================================================
+// process_orders_on_close = true -> entries fill at the signal candle's close
+// slippage = 0                   -> slippage is counted in TICKS, and a tick is 0.1 pip on
+//                                   some feeds but a full pip on others, so it is unreliable
+//                                   for forex. The spread is modelled as commission instead:
+// commission 0.004% per side     -> about 1 pip round-trip on major pairs, on ANY feed
+// margin 3%                      -> about 1:33 leverage, typical for retail forex
+//                                   (if you change it, also change MARGIN_PCT below)
+strategy("Price Action Signals [S/R + HTF Trend] - Strategy", shorttitle = "PA Strategy", overlay = true,
+     initial_capital = 10000, currency = currency.USD,
+     default_qty_type = strategy.fixed, default_qty_value = 1, pyramiding = 0,
+     process_orders_on_close = true, slippage = 0,
+     commission_type = strategy.commission.percent, commission_value = 0.004,
+     margin_long = 3, margin_short = 3,
+     max_labels_count = 500, max_lines_count = 500, max_boxes_count = 500)
+
+// =============================================================================
+//  1. SETTINGS
+// =============================================================================
+const string GRP_TREND = "1) Trend filter"
+const string GRP_SR    = "2) Support / Resistance zones"
+const string GRP_PAT   = "3) Candlestick patterns"
+const string GRP_RISK  = "4) Stop-loss / Take-profit / Risk"
+const string GRP_VIS   = "5) Display"
+
+// --- Trend filter ---
+emaLen  = input.int(50, "EMA length", minval = 1, group = GRP_TREND)
+trendTF = input.timeframe("240", "Trend timeframe", group = GRP_TREND,
+     tooltip = "Timeframe used for the trend filter. 240 = 4 hours. Must be HIGHER than your chart timeframe.")
+
+// --- Support / Resistance ---
+swingLen = input.int(10, "Swing lookback (bars each side)", minval = 2, group = GRP_SR,
+     tooltip = "A swing high/low must be the highest/lowest candle with this many bars on BOTH sides. Bigger = fewer, stronger zones.")
+maxZones = input.int(3, "Zones to keep (each side)", minval = 1, maxval = 20, group = GRP_SR)
+zoneMult = input.float(0.5, "Zone thickness (x ATR)", minval = 0.05, step = 0.05, group = GRP_SR,
+     tooltip = "How thick each zone is, as a multiple of the 14-bar Average True Range.")
+
+// --- Patterns (on/off toggles) ---
+useEngulf = input.bool(true, "Engulfing", group = GRP_PAT)
+usePin    = input.bool(true, "Pin bar", group = GRP_PAT)
+useInside = input.bool(true, "Inside bar", group = GRP_PAT)
+pinRatio  = input.float(2.0, "Pin bar: min wick / body ratio", minval = 1.0, step = 0.5, group = GRP_PAT)
+pinNose   = input.float(60, "Pin bar: min wick % of candle", minval = 50, maxval = 95, group = GRP_PAT)
+
+// --- Risk ---
+rrRatio  = input.float(2.0, "Risk : Reward (TP = risk x this)", minval = 2.0, step = 0.5, group = GRP_RISK,
+     tooltip = "2 means the take-profit is twice as far as the stop-loss (1:2). Minimum is 2.")
+slPips   = input.float(2.0, "SL buffer beyond wick (pips)", minval = 0, step = 0.5, group = GRP_RISK)
+pipOverride = input.float(0, "Pip size override (0 = auto)", minval = 0, step = 0.0001, group = GRP_RISK,
+     tooltip = "Leave at 0. Auto uses 0.0001 for forex pairs and 0.01 for JPY pairs.")
+cooldown = input.int(3, "Min bars between signals", minval = 0, group = GRP_RISK)
+riskPct  = input.float(1.0, "Risk per trade (% of equity)", minval = 0.1, maxval = 10, step = 0.1, group = GRP_RISK)
+
+// --- Display ---
+showZones  = input.bool(true, "Show S/R zones", group = GRP_VIS)
+showEma    = input.bool(true, "Show trend EMA", group = GRP_VIS)
+showLabels = input.bool(true, "Show BUY/SELL labels", group = GRP_VIS)
+showLines  = input.bool(true, "Show SL/TP lines", group = GRP_VIS)
+lineLen    = input.int(20, "SL/TP line length (bars)", minval = 1, maxval = 500, group = GRP_VIS)
+
+// =============================================================================
+//  2. HELPERS
+// =============================================================================
+// One pip, in price. A pip is a fixed size no matter how many decimals the data feed
+// shows (some feeds quote GBPUSD as 1.34805, others as 1.3480), so it must NOT be
+// derived from the tick size:
+//   • JPY-quoted pairs (USDJPY, GBPJPY ...): 1 pip = 0.01
+//   • all other forex pairs:                 1 pip = 0.0001
+//   • non-forex (gold, indices ...):          1 pip = 10 ticks (rough convention)
+f_pipSize() =>
+    syminfo.type == "forex" ? (syminfo.currency == "JPY" ? 0.01 : 0.0001) : syminfo.mintick * 10
+pip = pipOverride > 0 ? pipOverride : f_pipSize()
+
+// Must match margin_long / margin_short in the strategy() line above.
+const float MARGIN_PCT = 3.0
+
+f_fmt(float x) => str.tostring(x, format.mintick)
+
+f_names(bool e, bool p, bool i) =>
+    string s = ""
+    if e
+        s += "Engulfing"
+    if p
+        s += (s == "" ? "" : " + ") + "Pin Bar"
+    if i
+        s += (s == "" ? "" : " + ") + "Inside Bar"
+    s
+
+// Exchange rate from the pair's quote currency (e.g. JPY for USDJPY) to the
+// account currency (USD), so the 1% risk is correct on every pair.
+fxRate = request.currency_rate(syminfo.currency, strategy.account_currency)
+
+// Position size (in units) that loses riskPct % of equity if the stop is hit.
+// Example: $10,000 equity, 1% = $100. Stop 38 pips on GBPUSD = $0.0038 per unit
+// -> 100 / 0.0038 = 26,315 units (0.26 lot).
+// NOTE: the numbers TradingView prints next to trades on the chart (e.g. "TP +26315")
+// are this SIZE IN UNITS, not dollars of profit. Profit is in "List of Trades".
+f_qty(float entry, float sl) =>
+    float lossPerUnit = math.abs(entry - sl) * syminfo.pointvalue * fxRate
+    float riskCash    = strategy.equity * riskPct / 100
+    float riskQty     = lossPerUnit > 0 ? riskCash / lossPerUnit : 0.0
+    // Very tight stops would need a position bigger than the account's margin allows.
+    // TradingView would then force-close it early ("Margin call"), so cap the size at
+    // 90% of the available margin. On those rare trades the risk is a bit under 1%.
+    float maxQty      = strategy.equity * 0.9 / (entry * syminfo.pointvalue * fxRate * MARGIN_PCT / 100)
+    math.floor(math.min(riskQty, maxQty))
+
+// Format a size, e.g. "26,315 units (0.26 lot)".
+f_size(float qty) =>
+    str.tostring(qty, "#,###") + " units" + (syminfo.type == "forex" ? " (" + str.tostring(qty / 100000, "#.##") + " lot)" : "")
+
+// =============================================================================
+//  3. HIGHER-TIMEFRAME TREND
+// =============================================================================
+// [1] + lookahead_on = use the last CLOSED higher-timeframe candle -> no repainting.
+[htfClose, htfEma] = request.security(syminfo.tickerid, trendTF, [close[1], ta.ema(close, emaLen)[1]], lookahead = barmerge.lookahead_on)
+trendUp   = htfClose > htfEma
+trendDown = htfClose < htfEma
+
+// =============================================================================
+//  4. SUPPORT / RESISTANCE ZONES
+// =============================================================================
+atr   = ta.atr(14)
+ph    = ta.pivothigh(high, swingLen, swingLen)
+pl    = ta.pivotlow(low, swingLen, swingLen)
+zoneH = atr[swingLen] * zoneMult
+
+resBg  = color.new(color.red, showZones ? 85 : 100)
+resBd  = color.new(color.red, showZones ? 50 : 100)
+supBg  = color.new(color.green, showZones ? 85 : 100)
+supBd  = color.new(color.green, showZones ? 50 : 100)
+
+var array<box> resZones = array.new<box>()
+var array<box> supZones = array.new<box>()
+
+if not na(ph)
+    resZones.push(box.new(bar_index - swingLen, ph, bar_index, ph - zoneH, border_color = resBd, bgcolor = resBg, extend = extend.right))
+    if resZones.size() > maxZones
+        resZones.shift().delete()
+
+if not na(pl)
+    supZones.push(box.new(bar_index - swingLen, pl + zoneH, bar_index, pl, border_color = supBd, bgcolor = supBg, extend = extend.right))
+    if supZones.size() > maxZones
+        supZones.shift().delete()
+
+f_atSupport(float patLow) =>
+    bool hit = false
+    for z in supZones
+        if patLow <= z.get_top() and close >= z.get_bottom()
+            hit := true
+    hit
+
+f_atResistance(float patHigh) =>
+    bool hit = false
+    for z in resZones
+        if patHigh >= z.get_bottom() and close <= z.get_top()
+            hit := true
+    hit
+
+// =============================================================================
+//  5. CANDLESTICK PATTERNS
+// =============================================================================
+body     = math.abs(close - open)
+rng      = high - low
+upWick   = high - math.max(open, close)
+dnWick   = math.min(open, close) - low
+prevBody = math.abs(close[1] - open[1])
+
+bullEngulf = useEngulf and close > open and close[1] < open[1] and close >= open[1] and open <= close[1] and body > prevBody
+bearEngulf = useEngulf and close < open and close[1] > open[1] and close <= open[1] and open >= close[1] and body > prevBody
+
+bullPin = usePin and rng > 0 and dnWick >= pinRatio * body and dnWick >= rng * pinNose / 100 and upWick <= rng * 0.25
+bearPin = usePin and rng > 0 and upWick >= pinRatio * body and upWick >= rng * pinNose / 100 and dnWick <= rng * 0.25
+
+isInside   = high < high[1] and low > low[1]
+bullInside = useInside and isInside and close > open
+bearInside = useInside and isInside and close < open
+
+bullPattern = bullEngulf or bullPin or bullInside
+bearPattern = bearEngulf or bearPin or bearInside
+
+bullPatLow  = (bullEngulf or bullInside) ? math.min(low, low[1]) : low
+bearPatHigh = (bearEngulf or bearInside) ? math.max(high, high[1]) : high
+
+// =============================================================================
+//  6. ENTRY / STOP-LOSS / TAKE-PROFIT
+// =============================================================================
+buyEntry  = close
+buySL     = bullPatLow - slPips * pip
+buyTP     = buyEntry + (buyEntry - buySL) * rrRatio
+
+sellEntry = close
+sellSL    = bearPatHigh + slPips * pip
+sellTP    = sellEntry - (sellSL - sellEntry) * rrRatio
+
+// =============================================================================
+//  7. SIGNALS (identical to the indicator)
+// =============================================================================
+atSupport    = f_atSupport(bullPatLow)
+atResistance = f_atResistance(bearPatHigh)
+
+var int lastSigBar = na
+cooldownOk = na(lastSigBar) or bar_index - lastSigBar > cooldown
+
+buySignal  = barstate.isconfirmed and cooldownOk and trendUp and bullPattern and atSupport and buyEntry > buySL
+sellSignal = barstate.isconfirmed and cooldownOk and trendDown and bearPattern and atResistance and sellEntry < sellSL
+
+if buySignal or sellSignal
+    lastSigBar := bar_index
+
+// Remove zones that price has closed through.
+if supZones.size() > 0
+    for i = supZones.size() - 1 to 0
+        if close < supZones.get(i).get_bottom()
+            supZones.remove(i).delete()
+if resZones.size() > 0
+    for i = resZones.size() - 1 to 0
+        if close > resZones.get(i).get_top()
+            resZones.remove(i).delete()
+
+// =============================================================================
+//  8. SIMULATED TRADES (backtest only)
+// =============================================================================
+flat = strategy.position_size == 0
+
+if buySignal and flat
+    qty = f_qty(buyEntry, buySL)
+    if qty > 0
+        names = f_names(bullEngulf, bullPin, bullInside)
+        strategy.entry("Long", strategy.long, qty = qty, comment = "BUY " + names)
+        strategy.exit("Long exit", "Long", stop = buySL, limit = buyTP, comment_loss = "SL", comment_profit = "TP")
+        if showLabels
+            label.new(bar_index, low, "BUY  (" + names + ")\nEntry: " + f_fmt(buyEntry) + "\nSL: " + f_fmt(buySL) + "\nTP: " + f_fmt(buyTP) + "\nRisk: " + str.tostring((buyEntry - buySL) / pip, "#.#") + " pips = $" + str.tostring(qty * (buyEntry - buySL) * syminfo.pointvalue * fxRate, "#.##") + "\nSize: " + f_size(qty), yloc = yloc.belowbar, style = label.style_label_up, color = color.new(color.green, 0), textcolor = color.white, size = size.small)
+        if showLines
+            line.new(bar_index, buySL, bar_index + lineLen, buySL, color = color.red, width = 2)
+            line.new(bar_index, buyTP, bar_index + lineLen, buyTP, color = color.green, width = 2)
+
+if sellSignal and flat
+    qty = f_qty(sellEntry, sellSL)
+    if qty > 0
+        names = f_names(bearEngulf, bearPin, bearInside)
+        strategy.entry("Short", strategy.short, qty = qty, comment = "SELL " + names)
+        strategy.exit("Short exit", "Short", stop = sellSL, limit = sellTP, comment_loss = "SL", comment_profit = "TP")
+        if showLabels
+            label.new(bar_index, high, "SELL  (" + names + ")\nEntry: " + f_fmt(sellEntry) + "\nSL: " + f_fmt(sellSL) + "\nTP: " + f_fmt(sellTP) + "\nRisk: " + str.tostring((sellSL - sellEntry) / pip, "#.#") + " pips = $" + str.tostring(qty * (sellSL - sellEntry) * syminfo.pointvalue * fxRate, "#.##") + "\nSize: " + f_size(qty), yloc = yloc.abovebar, style = label.style_label_down, color = color.new(color.red, 0), textcolor = color.white, size = size.small)
+        if showLines
+            line.new(bar_index, sellSL, bar_index + lineLen, sellSL, color = color.red, width = 2)
+            line.new(bar_index, sellTP, bar_index + lineLen, sellTP, color = color.green, width = 2)
+
+plot(showEma ? htfEma : na, "Trend EMA", color = trendUp ? color.green : color.red, linewidth = 2, style = plot.style_stepline)
