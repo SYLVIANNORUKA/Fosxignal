@@ -6,11 +6,11 @@
 # Forex pairs to scan (no "=X", no slash).
 PAIRS = [
     "EURUSD", "GBPUSD", "USDJPY", "USDCAD", "AUDUSD",
-    "NZDUSD", "USDCHF", "EURJPY", "GBPJPY", "XAUUSD"
+    "NZDUSD", "USDCHF", "EURJPY", "GBPJPY"
 ]
 
 # Chart timeframes to scan. Allowed: "15M", "1H", "4H".
-TIMEFRAMES = ["5M", "15M", "1H", "4H"]
+TIMEFRAMES = ["15M", "1H", "4H"]
 
 # Which higher timeframe filters the trend for each chart timeframe.
 # Allowed trend timeframes: "4H" or "1D". It must be HIGHER than the chart timeframe.
