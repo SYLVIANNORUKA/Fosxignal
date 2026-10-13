@@ -1,6 +1,6 @@
 # Forex Signal Scanner → Telegram
 
-A Python copy of the **PA Signals** TradingView indicator (`PA_Signals_Indicator.pine`). It scans forex pairs on the **15M, 1H and 4H** timeframes and sends new signals to your phone through **Telegram**.
+A Python copy of the **PA Signals** TradingView indicator (`PA_Signals_Indicator.pine`). It scans forex pairs on the **5M, 15M, 1H and 4H** timeframes and sends new signals to your phone through **Telegram**.
 
 > ⚠️ **Signals only.** This scanner never connects to a broker and never places a trade. You decide and place every trade yourself.
 
@@ -19,7 +19,7 @@ Example message:
 | `scanner.py` | The scanner |
 | `config.py` | **Your settings**: pairs, timeframes, patterns on/off, R:R and so on |
 | `requirements.txt` | The Python libraries it needs |
-| `.github/workflows/scanner.yml` | Runs the scanner on GitHub every 15 minutes |
+| `.github/workflows/scanner.yml` | Runs the scanner on GitHub every 5 minutes |
 | `sent_signals.json` | Record of signals already sent, so nothing is sent twice. Updated automatically |
 | `PA_Signals_*.pine`, `SETUP_GUIDE.md` | The TradingView scripts and their guide |
 
@@ -29,7 +29,7 @@ Example message:
 
 | Rule | Setting |
 |---|---|
-| Trend filter | The last **closed** 4H candle above or below the 4H 50 EMA (for 15M and 1H charts). The 4H chart uses the **daily** 50 EMA instead |
+| Trend filter | The last **closed** 4H candle above or below the 4H 50 EMA (for 5M, 15M and 1H charts). The 4H chart uses the **daily** 50 EMA instead |
 | Support/resistance | Swing highs and lows with 10 candles on each side. 3 zones are kept on each side, each 0.5 × ATR(14) thick. A zone is removed once price **closes** through it |
 | Patterns | Engulfing, pin bar (wick ≥ 2× body and ≥ 60% of the candle), inside bar. Each can be switched on or off |
 | BUY | Bullish pattern touches support, closes back above it, and the trend is up |
@@ -38,9 +38,19 @@ Example message:
 | Take-profit | 1:2 risk:reward |
 | Cooldown | At least 3 candles between signals on the same chart |
 | Pip size | 0.0001, or 0.01 for JPY pairs |
-| No repainting | Only the most recently **closed** candle can give a new signal. A signal is never sent twice |
+| Minimum stop (`MIN_RISK_PIPS`) | Signals with a smaller stop-loss are not sent: 5M = 5 pips, 15M = 6 pips, 1H and 4H = no minimum. TradingView has no such filter, so it still shows these signals |
+| No repainting | Only the most recently **closed** candle of each timeframe can give a new signal. A signal is never sent twice |
 
 All of these can be changed in `config.py`.
+
+### Where the price data comes from
+
+| Timeframe | Yahoo data used |
+|---|---|
+| 5M | 5-minute candles, last 30 days. Yahoo only keeps about 60 days of 5-minute data, so 30 days stays safely inside the limit |
+| 15M | 15-minute candles, last 60 days |
+| 1H | 1-hour candles, last year |
+| 4H and daily | Built from the 1-hour candles. They start at 17:00 New York time, like TradingView's forex charts |
 
 ---
 
@@ -100,14 +110,14 @@ All of these can be changed in `config.py`.
 
 ---
 
-## Step 3: Run it automatically on GitHub (free, every 15 minutes)
+## Step 3: Run it automatically on GitHub (free, every 5 minutes)
 
 GitHub can run the scanner for you in the cloud, so your computer doesn't need to stay on.
 
 1. Create a free account at [github.com](https://github.com).
 2. Click **+** (top-right) → **New repository**.
    - Give it a name, for example `fx-signals`.
-   - Choose **Public**. Public repositories get unlimited free GitHub Actions minutes. A private repository will probably run out of its free 2,000 minutes a month, because the scanner runs about 2,500 times a month.
+   - Choose **Public**. Public repositories get unlimited free GitHub Actions minutes. A private repository would run out of its free 2,000 minutes a month in about a week, because the scanner runs about 7,500 times a month.
    - Your token stays secret either way, because it is stored as a secret in the next step and never in the files.
    - Click **Create repository**.
 3. Upload the files:
@@ -128,11 +138,14 @@ GitHub can run the scanner for you in the cloud, so your computer doesn't need t
    - Click **Forex signal scanner** → **Run workflow** → **Run workflow**.
    - After about a minute, click the run to see its log. "Done. 0 new signal(s)" is normal: most candles have no signal.
 
-From then on it runs **every 15 minutes, Sunday to Friday**, 2 minutes after each 15-minute candle closes.
+From then on it runs **every 5 minutes, Sunday to Friday**, 1 minute after each 5-minute candle closes (:01, :06, :11 … UTC). Every run checks all four timeframes, and 15M, 1H and 4H candles always close on one of these 5-minute marks.
+
+**Two runs never overlap.** The workflow has a *concurrency group*: if a run is still going when the next one is due, the new run waits until the first has finished. Each run also loads the very latest `sent_signals.json` when it starts, so a run that had to wait still knows what was just sent.
 
 **Good to know:**
 
-- GitHub sometimes starts scheduled runs 5–15 minutes late, and very occasionally skips one. Signals whose candle closed more than 60 minutes ago are not sent (`MAX_LATE_MINUTES` in `config.py`).
+- ⚠️ **GitHub's timing isn't exact.** Scheduled runs often start a few minutes late, and some are skipped when GitHub is busy. Each run only looks at the **most recently closed** candle. So if a run is late by more than 5 minutes, a **5M** signal from the candle before is never sent. 15M, 1H and 4H signals are rarely affected, because the next run usually happens before their next candle closes. If you rely on 5M signals, run the scanner on your own computer as well (Step 2), for example every 5 minutes with Windows Task Scheduler. Your computer and GitHub each keep their own `sent_signals.json` and don't share it. So when both catch the same signal, it arrives twice: once from each.
+- Signals whose candle closed more than 60 minutes ago are not sent (`MAX_LATE_MINUTES` in `config.py`).
 - GitHub pauses scheduled workflows in a repository that has had **no activity for 60 days**. If your messages stop, open the Actions tab and re-enable the workflow.
 - When a signal is sent, the bot commits an updated `sent_signals.json` to your repository. Those commits are expected.
 - To change settings, edit `config.py` on GitHub (click the file, then the ✏️ pencil icon), then **Commit changes**.
@@ -152,6 +165,7 @@ This prints the last 10 signals for every pair and timeframe, with the **candle 
 2. Open the same pair and timeframe, with **PA Signals** using the same settings as `config.py`.
    - For the 4H chart, set the indicator's **Trend timeframe** to **1D**.
 3. Find each printed time on the chart and check the label is there.
+   - Lines marked **[NOT SENT: stop below MIN_RISK_PIPS]** do appear on TradingView. The scanner just doesn't send them to Telegram.
 
 **Small differences are normal, because the price data differs:**
 

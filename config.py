@@ -6,15 +6,16 @@
 # Forex pairs to scan (no "=X", no slash).
 PAIRS = [
     "EURUSD", "GBPUSD", "USDJPY", "USDCAD", "AUDUSD",
-    "NZDUSD", "USDCHF", "EURJPY", "GBPJPY"
+    "NZDUSD", "USDCHF", "EURJPY", "GBPJPY",
 ]
 
-# Chart timeframes to scan. Allowed: "15M", "1H", "4H".
-TIMEFRAMES = ["15M", "1H", "4H"]
+# Chart timeframes to scan. Allowed: "5M", "15M", "1H", "4H".
+TIMEFRAMES = ["5M", "15M", "1H", "4H"]
 
 # Which higher timeframe filters the trend for each chart timeframe.
 # Allowed trend timeframes: "4H" or "1D". It must be HIGHER than the chart timeframe.
 TREND_TIMEFRAME = {
+    "5M":  "4H",
     "15M": "4H",
     "1H":  "4H",
     "4H":  "1D",
@@ -39,6 +40,16 @@ PIN_WICK_PERCENT = 60      # pin bar: nose wick at least this % of the whole can
 SL_BUFFER_PIPS = 2.0       # stop-loss this many pips beyond the pattern's wick
 RISK_REWARD = 2.0          # take-profit = risk x this (2.0 = 1:2)
 COOLDOWN_BARS = 3          # minimum bars between two signals on the same chart
+
+# Don't send a signal if its stop-loss is closer than this many pips (0 = no minimum).
+# Very tight stops on small timeframes are easily hit by the spread alone.
+# (TradingView still shows these signals; the scanner just doesn't send them.)
+MIN_RISK_PIPS = {
+    "5M":  5,
+    "15M": 6,
+    "1H":  0,
+    "4H":  0,
+}
 
 # --- Sending ---
 # Ignore a signal if its candle closed more than this many minutes ago.

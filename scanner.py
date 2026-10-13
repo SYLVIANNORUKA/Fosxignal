@@ -32,7 +32,12 @@ import config
 SENT_FILE = Path(__file__).with_name("sent_signals.json")
 KEEP_SENT_DAYS = 14
 
-TF_MINUTES = {"15M": 15, "1H": 60, "4H": 240, "1D": 1440}
+TF_MINUTES = {"5M": 5, "15M": 15, "1H": 60, "4H": 240, "1D": 1440}
+
+# Yahoo download for each short timeframe: (Yahoo interval, history period).
+# Yahoo only keeps about 60 days of 5m/15m candles. 30 days of 5m (~8,600 candles)
+# is plenty and keeps the download small and well inside the limit.
+INTRADAY = {"5M": ("5m", "30d"), "15M": ("15m", "60d")}
 TREND_NAME = {"4H": "4H", "1D": "Daily"}
 
 # TradingView's forex 4H and daily candles start at 17:00 New York time
@@ -106,7 +111,7 @@ def download(pair, interval, period):
     df = df[["Open", "High", "Low", "Close"]].dropna()
     df.index = df.index.tz_convert("UTC")
     # Drop odd rows Yahoo sometimes adds (e.g. a live tick stamped 10:37).
-    step = 15 if interval == "15m" else 60
+    step = {"5m": 5, "15m": 15}.get(interval, 60)
     df = df[df.index.minute % step == 0]
     df = df[~df.index.duplicated(keep="last")]
     # Round like a real price feed so comparisons (e.g. close >= open) match TradingView.
@@ -163,13 +168,12 @@ def load_charts(pair, now):
             ambiguous = np.ones(len(chart), dtype=bool)   # DST change-over hour: pick summer time
             chart["open_utc"] = chart.index.tz_localize(NY, ambiguous=ambiguous,
                                                         nonexistent="shift_forward").tz_convert("UTC")
-        elif tf in ("15M", "1H"):
-            # Yahoo keeps only ~60 days of 15-minute data, which is plenty here.
-            chart = download(pair, "15m", "60d") if tf == "15M" else data_1h.copy()
+        elif tf in INTRADAY or tf == "1H":
+            chart = download(pair, *INTRADAY[tf]) if tf in INTRADAY else data_1h.copy()
             chart["ny"] = to_ny(chart.index)
             chart["open_utc"] = chart.index
         else:
-            raise ValueError(f"Unknown timeframe {tf!r} in config.TIMEFRAMES (use 15M, 1H or 4H)")
+            raise ValueError(f"Unknown timeframe {tf!r} in config.TIMEFRAMES (use 5M, 15M, 1H or 4H)")
         chart = chart.reset_index(drop=True)
 
         # Keep CLOSED candles only - the candle still forming is ignored (no repainting).
@@ -339,6 +343,16 @@ def save_sent(sent):
 # =============================================================================
 #  MODES
 # =============================================================================
+def too_small(tf, sig):
+    """True if the stop-loss is closer than MIN_RISK_PIPS for this timeframe.
+
+    This filter is applied only when SENDING, after the Pine logic has run. The
+    signal still counts for the cooldown, exactly as on your TradingView chart
+    (which has no such filter), so the scanner and the chart stay in step.
+    """
+    return sig["risk_pips"] < config.MIN_RISK_PIPS.get(tf, 0)
+
+
 def scan(dry_run):
     token, chat_id = (None, None) if dry_run else telegram_settings()
     now = pd.Timestamp.now(tz="UTC")
@@ -364,6 +378,10 @@ def scan(dry_run):
             if now - closed_at > pd.Timedelta(minutes=config.MAX_LATE_MINUTES):
                 print(f"[{pair} {tf}] signal on candle closed at {closed_at:%Y-%m-%d %H:%M} UTC is too old - not sent")
                 continue
+            if too_small(tf, sig):
+                print(f"[{pair} {tf}] signal skipped - stop-loss {sig['risk_pips']:.1f} pips is below MIN_RISK_PIPS")
+                continue
+            # One key per pair + timeframe + candle + direction, so each signal is sent only once.
             key = f"{pair}|{tf}|{sig['open_utc']:%Y-%m-%d %H:%M}|{sig['direction']}"
             if key in sent:
                 continue   # already sent on an earlier run
@@ -397,7 +415,8 @@ def backcheck():
             signals = find_signals(chart, pair)[-10:]
             print(f"=== {pair} {tf}  ({len(signals)} shown) ===")
             for sig in signals:
-                print(f"  {sig['open_utc']:%Y-%m-%d %H:%M}  " + format_message(pair, tf, sig))
+                note = "   [NOT SENT: stop below MIN_RISK_PIPS]" if too_small(tf, sig) else ""
+                print(f"  {sig['open_utc']:%Y-%m-%d %H:%M}  " + format_message(pair, tf, sig) + note)
             print()
 
 
