@@ -1,24 +1,27 @@
 """
 Forex price-action SIGNAL scanner  -  a Python copy of PA_Signals_Indicator.pine.
 
-It ONLY sends signals to Telegram. It never connects to a broker and never
-places trades. You decide and place every trade yourself.
+It ONLY sends signals to Telegram (and, optionally, by email). It never connects
+to a broker and never places trades. You decide and place every trade yourself.
 
 How to run it:
-    python scanner.py              scan all pairs and send NEW signals to Telegram
-    python scanner.py --test       send one test message to Telegram
+    python scanner.py              scan all pairs and send NEW signals
+    python scanner.py --test       send one test message (Telegram, plus email if set up)
     python scanner.py --backcheck  print the last 10 signals per pair and timeframe
                                    (to compare with TradingView). Sends nothing.
     python scanner.py --dry-run    scan and print what WOULD be sent. Sends nothing.
 
-Settings are in config.py. Telegram details come from the environment variables
-TELEGRAM_TOKEN and TELEGRAM_CHAT_ID (never written in the code).
+Settings are in config.py. Secrets come from environment variables, never the code:
+    TELEGRAM_TOKEN, TELEGRAM_CHAT_ID                  (required)
+    EMAIL_ADDRESS, EMAIL_APP_PASSWORD, EMAIL_TO       (optional - email is skipped if any is missing)
 """
 
 import argparse
 import json
 import os
+import smtplib
 import sys
+from email.message import EmailMessage
 from pathlib import Path
 
 import numpy as np
@@ -325,6 +328,49 @@ def send_telegram(text, token, chat_id):
 
 
 # =============================================================================
+#  EMAIL (optional, Gmail)
+# =============================================================================
+def email_settings():
+    """Return the Gmail settings, or None if any of the three is missing (email is then skipped)."""
+    address = os.environ.get("EMAIL_ADDRESS", "").strip()
+    # Google shows App Passwords in groups like "abcd efgh ijkl mnop" - remove the spaces.
+    password = os.environ.get("EMAIL_APP_PASSWORD", "").replace(" ", "").strip()
+    # EMAIL_TO can be one address, or several separated by commas.
+    to = [a.strip() for a in os.environ.get("EMAIL_TO", "").split(",") if a.strip()]
+    if not address or not password or not to:
+        return None
+    return {"address": address, "password": password, "to": to}
+
+
+def send_email(subject, body, settings):
+    """Send one email through Gmail's SMTP server using an App Password."""
+    msg = EmailMessage()
+    msg["Subject"] = subject
+    msg["From"] = settings["address"]
+    msg["To"] = ", ".join(settings["to"])
+    msg.set_content(body)
+    with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=30) as server:
+        server.login(settings["address"], settings["password"])
+        server.send_message(msg)
+
+
+def email_signal(message, settings):
+    """Email one signal. Subject = the first part of the message, e.g. "🔴 SELL EURUSD (1H) – Pin Bar".
+
+    A failed email only prints a warning: Telegram has already been sent, and
+    stopping here would make the next run send the Telegram message again.
+    """
+    subject = message.split(" | ")[0]
+    body = ("\n".join(message.split(" | "))
+            + "\n\nSignal only - this scanner never places trades. Always check the chart before trading.")
+    try:
+        send_email(subject, body, settings)
+        print("Emailed: " + subject)
+    except Exception as e:   # smtplib errors never include the password
+        print(f"WARNING: email not sent ({type(e).__name__}: {e})")
+
+
+# =============================================================================
 #  SENT-SIGNAL RECORD
 # =============================================================================
 def load_sent():
@@ -355,6 +401,8 @@ def too_small(tf, sig):
 
 def scan(dry_run):
     token, chat_id = (None, None) if dry_run else telegram_settings()
+    email = email_settings()
+    print("Email alerts: " + ("on" if email else "off (EMAIL_ADDRESS / EMAIL_APP_PASSWORD / EMAIL_TO not all set)"))
     now = pd.Timestamp.now(tz="UTC")
     sent = load_sent()
     failed = 0
@@ -395,6 +443,8 @@ def scan(dry_run):
             print("Sent: " + message)
             sent[key] = now.isoformat()
             save_sent(sent)   # save straight away so a later crash can't cause a repeat
+            if email:
+                email_signal(message, email)
 
     print(f"Done. {found} new signal(s). {failed} pair(s) failed.")
     if failed == len(config.PAIRS):
@@ -422,7 +472,7 @@ def backcheck():
 
 def main():
     parser = argparse.ArgumentParser(description="Forex price-action signal scanner (signals only, never trades).")
-    parser.add_argument("--test", action="store_true", help="send one test message to Telegram")
+    parser.add_argument("--test", action="store_true", help="send one test message to Telegram (and email, if set up)")
     parser.add_argument("--backcheck", action="store_true", help="print the last 10 signals per pair/timeframe")
     parser.add_argument("--dry-run", action="store_true", help="scan and print, but send nothing")
     args = parser.parse_args()
@@ -434,7 +484,15 @@ def main():
     if args.test:
         token, chat_id = telegram_settings()
         send_telegram("✅ Test from your forex signal scanner. Telegram is set up correctly!", token, chat_id)
-        print("Test message sent.")
+        print("Telegram test message sent.")
+        email = email_settings()
+        if email:
+            # Here an email error is shown in full, so you can fix the settings.
+            send_email("✅ Test from your forex signal scanner",
+                       "Email alerts are set up correctly!\n\nSignal only - this scanner never places trades.", email)
+            print("Test email sent to " + ", ".join(email["to"]) + ".")
+        else:
+            print("Email not set up (EMAIL_ADDRESS / EMAIL_APP_PASSWORD / EMAIL_TO) - skipped.")
     elif args.backcheck:
         backcheck()
     else:

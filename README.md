@@ -1,6 +1,6 @@
 # Forex Signal Scanner → Telegram
 
-A Python copy of the **PA Signals** TradingView indicator (`PA_Signals_Indicator.pine`). It scans forex pairs on the **5M, 15M, 1H and 4H** timeframes and sends new signals to your phone through **Telegram**.
+A Python copy of the **PA Signals** TradingView indicator (`PA_Signals_Indicator.pine`). It scans forex pairs on the **5M, 15M, 1H and 4H** timeframes and sends new signals to your phone through **Telegram**, and optionally by **email** (Gmail).
 
 > ⚠️ **Signals only.** This scanner never connects to a broker and never places a trade. You decide and place every trade yourself.
 
@@ -99,11 +99,21 @@ All of these can be changed in `config.py`.
    export TELEGRAM_CHAT_ID="123456789"
    ```
 
+   Optional, for email alerts (see [Email alerts](#optional-email-alerts-gmail) below):
+
+   ```powershell
+   $env:EMAIL_ADDRESS = "you@gmail.com"
+   $env:EMAIL_APP_PASSWORD = "abcd efgh ijkl mnop"
+   $env:EMAIL_TO = "you@gmail.com"
+   ```
+
+   On Mac / Linux, use `export EMAIL_ADDRESS="you@gmail.com"` and so on.
+
 5. Try it:
 
    | Command | What it does |
    |---|---|
-   | `python scanner.py --test` | Sends one test message. Check your phone |
+   | `python scanner.py --test` | Sends one test message to Telegram, and a test email if email is set up. Check your phone and inbox |
    | `python scanner.py --dry-run` | Scans and prints what it would send, without sending |
    | `python scanner.py --backcheck` | Prints the last 10 signals per pair and timeframe (no Telegram needed) |
    | `python scanner.py` | The real scan: sends new signals to Telegram |
@@ -153,6 +163,52 @@ From then on it runs **every 5 minutes, Sunday to Friday**, 1 minute after each 
 
 ---
 
+## Optional: Email alerts (Gmail)
+
+Each signal can also arrive as an email, with the signal as the subject line:
+
+```
+Subject: 🔴 SELL EURUSD (1H) – Pin Bar
+```
+
+The email body lists the entry, SL, TP, risk and trend on separate lines. Telegram keeps working as before. **Email is optional:** if the three email secrets aren't set, the scanner skips email and sends Telegram only.
+
+### A. Create a Gmail App Password (about 5 minutes)
+
+An App Password is a special 16-letter password that only lets the scanner send email. Your real Gmail password is never used, and you can delete the App Password at any time.
+
+1. **Turn on 2-Step Verification** (Google requires it before you can create App Passwords):
+   - Go to [myaccount.google.com/security](https://myaccount.google.com/security).
+   - Under **How you sign in to Google**, click **2-Step Verification** and follow the steps. Skip this if it's already on.
+2. Go to [myaccount.google.com/apppasswords](https://myaccount.google.com/apppasswords) and sign in again if asked.
+3. Under **App name**, type `Forex scanner` and click **Create**.
+4. Google shows a 16-letter password, like `abcd efgh ijkl mnop`. **Copy it now**, because Google only shows it once.
+   - Spaces don't matter; the scanner removes them.
+   - 🔒 Treat it like a password. Never put it in a file you upload.
+
+If the App Passwords page says the setting isn't available, 2-Step Verification is not on yet (step 1). On a work or school account, your administrator may have blocked App Passwords. Use a personal Gmail account instead.
+
+### B. Add the three email secrets on GitHub
+
+Go to your repository's **Settings → Secrets and variables → Actions → New repository secret**, and add each of these:
+
+| Name | Secret (what to paste) |
+|---|---|
+| `EMAIL_ADDRESS` | The Gmail address you created the App Password for, e.g. `you@gmail.com` |
+| `EMAIL_APP_PASSWORD` | The 16-letter App Password from step A |
+| `EMAIL_TO` | Where to send the alerts. Usually the same address. For several addresses, separate them with commas: `you@gmail.com,friend@example.com` |
+
+The names must be typed **exactly** as shown, in capitals. The workflow already passes these secrets to the scanner, so no other change is needed. From the next run, each signal is also emailed.
+
+### C. Test it
+
+- **On GitHub:** go to **Actions → Forex signal scanner → Run workflow**. Open the run and click **Scan and send signals**. The log should show `Email alerts: on`. If it shows `off`, one of the three secrets is missing or misspelled. An email only arrives when there is a new signal.
+- **On your computer:** set the three `EMAIL_...` variables (Step 2, point 4) and run `python scanner.py --test`. A test email should arrive within a minute. Check your **Spam** folder the first time, and mark it **Not spam**.
+
+To turn email off again, delete the `EMAIL_APP_PASSWORD` secret on GitHub. You can also revoke the App Password at [myaccount.google.com/apppasswords](https://myaccount.google.com/apppasswords).
+
+---
+
 ## Step 4: Compare with TradingView (`--backcheck`)
 
 ```
@@ -184,6 +240,9 @@ Most signals should match. Many mismatches on one pair usually means the setting
 | `ERROR: set the TELEGRAM_TOKEN ...` | The environment variables or GitHub secrets are missing or misspelled |
 | `Telegram refused the message: 401` | The token is wrong |
 | `Telegram refused the message: 400 chat not found` | The chat ID is wrong, or you haven't pressed **Start** in your bot's chat |
+| `Email alerts: off` in the log | One of `EMAIL_ADDRESS`, `EMAIL_APP_PASSWORD`, `EMAIL_TO` is missing or misspelled |
+| `WARNING: email not sent (SMTPAuthenticationError ...)` | Wrong App Password, or `EMAIL_ADDRESS` isn't the account that created it. Create a new App Password and update the secret. Your normal Gmail password won't work here |
+| Test email never arrives | Check the Spam folder and mark it **Not spam** |
 | `[EURUSD] skipped - no data` | Yahoo had a temporary problem. The next run usually works |
 | No messages for a long time | Usually normal, because signals need several conditions to line up. Check the Actions tab for red ❌ runs |
 | Workflow fails at "Save sent-signal record" | Do Step 3, point 5 (Read and write permissions) |
