@@ -1,0 +1,353 @@
+//@version=6
+// =============================================================================
+//  MY SETUP  [BOS + Double Top/Bottom, HTF Trend]  —  INDICATOR
+// -----------------------------------------------------------------------------
+//  WHAT IT DOES
+//   • Finds LEVELS: two swing lows (or two swing highs) at about the same price
+//     ("Equal level tolerance", default 3 pips) = a double bottom (or top).
+//   • Gives four setups, each with its own on/off switch:
+//       1. BOS SELL    - trend down, a strong bearish candle CLOSES BELOW a double-bottom level
+//       2. BOS BUY     - trend up, a strong bullish candle CLOSES ABOVE a double-top level
+//       3. BOUNCE BUY  - trend up, price comes back to a double-bottom level and a
+//                        bullish pin bar / engulfing closes back above it
+//       4. BOUNCE SELL - trend down, price comes back to a double-top level and a
+//                        bearish pin bar / engulfing closes back below it
+//   • Trend = last CLOSED higher-timeframe candle above/below its 50 EMA
+//     (default 4H). Bearish trend = sells only, bullish trend = buys only.
+//   • Stop-loss beyond the signal candle's wick + a pip buffer; take-profit at
+//     risk x R:R (minimum 1:2).
+//
+//  WHAT IT DOES NOT DO
+//   • It NEVER places trades. It only draws signals and fires alerts.
+//
+//  NO REPAINTING
+//   • Signals are confirmed only when the candle CLOSES.
+//   • Swings are confirmed "Swing lookback" bars after the swing, so a level
+//     appears a few candles after its second low/high. This is normal.
+//
+//  Separate from the PA Signals scripts: labels say "MY: ...", are blue/orange,
+//  and the info table sits bottom-right (PA's is top-right).
+// =============================================================================
+indicator("MY Setup [BOS + Double Top/Bottom]", shorttitle = "MY Setup", overlay = true,
+     max_labels_count = 500, max_lines_count = 500, max_boxes_count = 500)
+
+// =============================================================================
+//  1. SETTINGS (gear icon on the indicator)
+// =============================================================================
+const string GRP_TREND = "1) Trend filter"
+const string GRP_LVL   = "2) Swing levels (double tops / bottoms)"
+const string GRP_SET   = "3) Setups (on / off)"
+const string GRP_PAT   = "4) Candle rules"
+const string GRP_RISK  = "5) Stop-loss / Take-profit"
+const string GRP_VIS   = "6) Display"
+
+// --- Trend filter ---
+emaLen  = input.int(50, "EMA length", minval = 1, group = GRP_TREND)
+trendTF = input.timeframe("240", "Trend timeframe", group = GRP_TREND,
+     tooltip = "Timeframe used for the trend filter. 240 = 4 hours. Must be HIGHER than your chart timeframe.")
+
+// --- Levels ---
+swingLen  = input.int(5, "Swing lookback (bars each side)", minval = 1, group = GRP_LVL,
+     tooltip = "A swing low/high must be the lowest/highest candle with this many bars on BOTH sides.")
+eqTolPips = input.float(3.0, "Equal level tolerance (pips)", minval = 0, step = 0.5, group = GRP_LVL,
+     tooltip = "Two swing lows (or highs) this close together form a level. Also how close price must come back to a level for a Bounce.")
+swingMem  = input.int(10, "Swings remembered (each side)", minval = 2, maxval = 50, group = GRP_LVL,
+     tooltip = "A new swing is compared with this many earlier swings to find its 'equal' partner.")
+maxLevels = input.int(5, "Levels to keep (each side)", minval = 1, maxval = 20, group = GRP_LVL)
+
+// --- Setups ---
+useBosSell    = input.bool(true, "Setup 1: BOS SELL", group = GRP_SET)
+useBosBuy     = input.bool(true, "Setup 2: BOS BUY", group = GRP_SET)
+useBounceBuy  = input.bool(true, "Setup 3: BOUNCE BUY (double bottom)", group = GRP_SET)
+useBounceSell = input.bool(true, "Setup 4: BOUNCE SELL (double top)", group = GRP_SET)
+
+// --- Candle rules ---
+bodyPct  = input.float(50, "BOS: min body % of candle", minval = 10, maxval = 100, step = 5, group = GRP_PAT,
+     tooltip = "The breakout candle's body must be at least this % of its whole high-to-low range.")
+pinRatio = input.float(2.0, "Pin bar: min wick / body ratio", minval = 1.0, step = 0.5, group = GRP_PAT)
+pinNose  = input.float(60, "Pin bar: min wick % of candle", minval = 50, maxval = 95, group = GRP_PAT)
+
+// --- Risk ---
+rrRatio     = input.float(2.0, "Risk : Reward (TP = risk x this)", minval = 2.0, step = 0.5, group = GRP_RISK,
+     tooltip = "2 means the take-profit is twice as far as the stop-loss (1:2). Minimum is 2.")
+slPips      = input.float(2.0, "SL buffer beyond wick (pips)", minval = 0, step = 0.5, group = GRP_RISK)
+pipOverride = input.float(0, "Pip size override (0 = auto)", minval = 0, step = 0.0001, group = GRP_RISK,
+     tooltip = "Leave at 0. Auto uses 0.0001 for forex pairs and 0.01 for JPY pairs. The table shows the pip size in use.")
+cooldown    = input.int(3, "Min bars between signals", minval = 0, group = GRP_RISK)
+
+// --- Display ---
+showLevels = input.bool(true, "Show levels", group = GRP_VIS)
+showEma    = input.bool(true, "Show trend EMA", group = GRP_VIS)
+showLabels = input.bool(true, "Show MY labels", group = GRP_VIS)
+showLines  = input.bool(true, "Show SL/TP lines", group = GRP_VIS)
+lineLen    = input.int(20, "SL/TP line length (bars)", minval = 1, maxval = 500, group = GRP_VIS)
+showTable  = input.bool(true, "Show info table", group = GRP_VIS)
+
+// MY colours (PA Signals uses green/red, so these are easy to tell apart).
+color BUY_COL  = #2962ff   // blue
+color SELL_COL = #ff6d00   // orange
+
+// =============================================================================
+//  2. HELPERS
+// =============================================================================
+// One pip: 0.01 for JPY-quoted pairs, 0.0001 for other forex pairs, 10 ticks otherwise.
+// Not taken from the tick size, because feeds differ (1.3480 vs 1.34805).
+f_pipSize() =>
+    syminfo.type == "forex" ? (syminfo.currency == "JPY" ? 0.01 : 0.0001) : syminfo.mintick * 10
+pip = pipOverride > 0 ? pipOverride : f_pipSize()
+tol = eqTolPips * pip
+
+f_fmt(float x) => str.tostring(x, format.mintick)
+
+// Turn a timeframe string like "240" into a readable "4H".
+f_tfLabel(string tf) =>
+    float mins = timeframe.in_seconds(tf) / 60
+    str.endswith(tf, "M") ? tf : mins >= 10080 ? str.tostring(mins / 10080, "#.##") + "W" : mins >= 1440 ? str.tostring(mins / 1440, "#.##") + "D" : mins >= 60 ? str.tostring(mins / 60, "#.##") + "H" : str.tostring(mins, "#.##") + "m"
+
+// Setup name, e.g. "BOS SELL", or "BOS + BOUNCE BUY" if both fire on one candle.
+f_setupName(bool bos, bool bounce, string side) =>
+    bos and bounce ? "BOS + BOUNCE " + side : bos ? "BOS " + side : "BOUNCE " + side
+
+// =============================================================================
+//  3. HIGHER-TIMEFRAME TREND
+// =============================================================================
+// [1] + lookahead_on = use the last CLOSED higher-timeframe candle -> no repainting.
+[htfClose, htfEma] = request.security(syminfo.tickerid, trendTF, [close[1], ta.ema(close, emaLen)[1]], lookahead = barmerge.lookahead_on)
+trendUp   = htfClose > htfEma
+trendDown = htfClose < htfEma
+badTF     = timeframe.in_seconds(trendTF) < timeframe.in_seconds(timeframe.period)
+
+// =============================================================================
+//  4. LEVELS = DOUBLE BOTTOMS (equal swing lows) / DOUBLE TOPS (equal swing highs)
+// =============================================================================
+// A level spans from the lower to the higher of its two swing prices.
+type Level
+    float top
+    float bottom
+    box   zone
+
+var array<Level> supLevels  = array.new<Level>()   // double bottoms (support)
+var array<Level> resLevels  = array.new<Level>()   // double tops (resistance)
+var array<float> swLows     = array.new<float>()   // recent swing lows ...
+var array<int>   swLowBars  = array.new<int>()     // ... and the bar each one formed on
+var array<float> swHighs    = array.new<float>()
+var array<int>   swHighBars = array.new<int>()
+
+supBg = color.new(BUY_COL, showLevels ? 80 : 100)
+supBd = color.new(BUY_COL, showLevels ? 20 : 100)
+resBg = color.new(SELL_COL, showLevels ? 80 : 100)
+resBd = color.new(SELL_COL, showLevels ? 20 : 100)
+
+pl = ta.pivotlow(low, swingLen, swingLen)     // swing low confirmed swingLen bars after it
+ph = ta.pivothigh(high, swingLen, swingLen)   // swing high
+
+// --- New swing low: does it pair with an earlier swing low to form a double bottom? ---
+if not na(pl)
+    // Already touching an existing level? Then it's just another touch, not a new level.
+    bool known = false
+    for lv in supLevels
+        if pl >= lv.bottom - tol and pl <= lv.top + tol
+            known := true
+    if not known and swLows.size() > 0
+        // Look back through earlier swing lows, newest first.
+        for i = swLows.size() - 1 to 0
+            prevLow = swLows.get(i)
+            if math.abs(pl - prevLow) <= tol
+                lvBottom = math.min(pl, prevLow)
+                lvTop    = math.max(pl, prevLow)
+                if close >= lvBottom   // skip if price has already closed below it
+                    supLevels.push(Level.new(lvTop, lvBottom, box.new(swLowBars.get(i), lvTop, bar_index, lvBottom, border_color = supBd, border_style = line.style_dashed, bgcolor = supBg, extend = extend.right)))
+                    if supLevels.size() > maxLevels
+                        supLevels.shift().zone.delete()   // drop the oldest level
+                break
+            if prevLow < pl - tol
+                break   // a lower low in between: older lows can't pair with this one
+    swLows.push(pl)
+    swLowBars.push(bar_index - swingLen)
+    if swLows.size() > swingMem
+        swLows.shift()
+        swLowBars.shift()
+
+// --- New swing high: does it pair with an earlier swing high to form a double top? ---
+if not na(ph)
+    bool known = false
+    for lv in resLevels
+        if ph >= lv.bottom - tol and ph <= lv.top + tol
+            known := true
+    if not known and swHighs.size() > 0
+        for i = swHighs.size() - 1 to 0
+            prevHigh = swHighs.get(i)
+            if math.abs(ph - prevHigh) <= tol
+                lvBottom = math.min(ph, prevHigh)
+                lvTop    = math.max(ph, prevHigh)
+                if close <= lvTop   // skip if price has already closed above it
+                    resLevels.push(Level.new(lvTop, lvBottom, box.new(swHighBars.get(i), lvTop, bar_index, lvBottom, border_color = resBd, border_style = line.style_dashed, bgcolor = resBg, extend = extend.right)))
+                    if resLevels.size() > maxLevels
+                        resLevels.shift().zone.delete()
+                break
+            if prevHigh > ph + tol
+                break   // a higher high in between: older highs can't pair with this one
+    swHighs.push(ph)
+    swHighBars.push(bar_index - swingLen)
+    if swHighs.size() > swingMem
+        swHighs.shift()
+        swHighBars.shift()
+
+// =============================================================================
+//  5. CANDLES
+// =============================================================================
+body     = math.abs(close - open)
+rng      = high - low
+upWick   = high - math.max(open, close)
+dnWick   = math.min(open, close) - low
+prevBody = math.abs(close[1] - open[1])
+
+// Strong candle for a BOS: body at least bodyPct % of the candle.
+strongBull = rng > 0 and close > open and body >= rng * bodyPct / 100
+strongBear = rng > 0 and close < open and body >= rng * bodyPct / 100
+
+// Rejection candles for a Bounce (same rules as the PA Signals indicator).
+bullEngulf = close > open and close[1] < open[1] and close >= open[1] and open <= close[1] and body > prevBody
+bearEngulf = close < open and close[1] > open[1] and close <= open[1] and open >= close[1] and body > prevBody
+bullPin    = rng > 0 and dnWick >= pinRatio * body and dnWick >= rng * pinNose / 100 and upWick <= rng * 0.25
+bearPin    = rng > 0 and upWick >= pinRatio * body and upWick >= rng * pinNose / 100 and dnWick <= rng * 0.25
+
+// The pattern's extreme wick. Engulfing is a two-candle pattern, so it uses both candles.
+bullPatLow  = bullEngulf ? math.min(low, low[1]) : low
+bearPatHigh = bearEngulf ? math.max(high, high[1]) : high
+
+// =============================================================================
+//  6. SETUPS
+// =============================================================================
+// Levels are removed as soon as price closes through them (section 8), so a level
+// still in the list has never been broken - a close beyond it now IS the break.
+bool brokeSupport = false    // closed below a double bottom
+bool bounceSupport = false   // wick back into a double bottom, closed back above it
+for lv in supLevels
+    if close < lv.bottom
+        brokeSupport := true
+    if bullPatLow >= lv.bottom - tol and bullPatLow <= lv.top + tol and close > lv.top
+        bounceSupport := true
+
+bool brokeResistance = false    // closed above a double top
+bool bounceResistance = false   // wick back into a double top, closed back below it
+for lv in resLevels
+    if close > lv.top
+        brokeResistance := true
+    if bearPatHigh <= lv.top + tol and bearPatHigh >= lv.bottom - tol and close < lv.bottom
+        bounceResistance := true
+
+bosSell    = useBosSell and trendDown and strongBear and brokeSupport
+bosBuy     = useBosBuy and trendUp and strongBull and brokeResistance
+bounceBuy  = useBounceBuy and trendUp and (bullPin or bullEngulf) and bounceSupport
+bounceSell = useBounceSell and trendDown and (bearPin or bearEngulf) and bounceResistance
+
+// Entry / SL / TP. BOS: SL beyond this candle's wick. Bounce: beyond the pattern's wick.
+buyEntry  = close
+buySL     = (bounceBuy ? bullPatLow : low) - slPips * pip
+buyTP     = buyEntry + (buyEntry - buySL) * rrRatio
+sellEntry = close
+sellSL    = (bounceSell ? bearPatHigh : high) + slPips * pip
+sellTP    = sellEntry - (sellSL - sellEntry) * rrRatio
+
+var int lastSigBar = na
+cooldownOk = na(lastSigBar) or bar_index - lastSigBar > cooldown
+
+buySignal  = barstate.isconfirmed and cooldownOk and (bosBuy or bounceBuy) and buyEntry > buySL
+sellSignal = barstate.isconfirmed and cooldownOk and (bosSell or bounceSell) and sellEntry < sellSL
+
+// =============================================================================
+//  7. DRAW SIGNALS (blue/orange labels + diamonds, dashed SL/TP lines)
+// =============================================================================
+var string lastName  = "None yet"
+var float  lastEntry = na
+var float  lastSL    = na
+var float  lastTP    = na
+var int    lastTime  = na
+
+if buySignal
+    name = f_setupName(bosBuy, bounceBuy, "BUY")
+    lastSigBar := bar_index
+    lastName   := name
+    lastEntry  := buyEntry
+    lastSL     := buySL
+    lastTP     := buyTP
+    lastTime   := time
+    if showLabels
+        label.new(bar_index, buySL, "MY: " + name + "\nEntry: " + f_fmt(buyEntry) + "\nSL: " + f_fmt(buySL) + "\nTP: " + f_fmt(buyTP) + "\nRisk: " + str.tostring((buyEntry - buySL) / pip, "#.#") + " pips", yloc = yloc.price, style = label.style_label_up, color = BUY_COL, textcolor = color.white, size = size.small)
+    if showLines
+        line.new(bar_index, buySL, bar_index + lineLen, buySL, color = color.red, style = line.style_dashed, width = 2)
+        line.new(bar_index, buyTP, bar_index + lineLen, buyTP, color = color.lime, style = line.style_dashed, width = 2)
+        line.new(bar_index, buyEntry, bar_index + lineLen, buyEntry, color = BUY_COL, style = line.style_dotted)
+
+if sellSignal
+    name = f_setupName(bosSell, bounceSell, "SELL")
+    lastSigBar := bar_index
+    lastName   := name
+    lastEntry  := sellEntry
+    lastSL     := sellSL
+    lastTP     := sellTP
+    lastTime   := time
+    if showLabels
+        label.new(bar_index, sellSL, "MY: " + name + "\nEntry: " + f_fmt(sellEntry) + "\nSL: " + f_fmt(sellSL) + "\nTP: " + f_fmt(sellTP) + "\nRisk: " + str.tostring((sellSL - sellEntry) / pip, "#.#") + " pips", yloc = yloc.price, style = label.style_label_down, color = SELL_COL, textcolor = color.white, size = size.small)
+    if showLines
+        line.new(bar_index, sellSL, bar_index + lineLen, sellSL, color = color.red, style = line.style_dashed, width = 2)
+        line.new(bar_index, sellTP, bar_index + lineLen, sellTP, color = color.lime, style = line.style_dashed, width = 2)
+        line.new(bar_index, sellEntry, bar_index + lineLen, sellEntry, color = SELL_COL, style = line.style_dotted)
+
+// Diamonds mark every MY signal (PA Signals uses triangles).
+plotshape(buySignal, "MY buy", shape.diamond, location.belowbar, BUY_COL, size = size.tiny)
+plotshape(sellSignal, "MY sell", shape.diamond, location.abovebar, SELL_COL, size = size.tiny)
+
+plot(showEma ? htfEma : na, "MY trend EMA", color = trendUp ? BUY_COL : SELL_COL, linewidth = 2, style = plot.style_stepline)
+
+// =============================================================================
+//  8. REMOVE BROKEN LEVELS (after the signals above have used them)
+// =============================================================================
+// A broken level stays on the chart, but stops extending to the right.
+if supLevels.size() > 0
+    for i = supLevels.size() - 1 to 0
+        lv = supLevels.get(i)
+        if close < lv.bottom
+            lv.zone.set_right(bar_index)
+            lv.zone.set_extend(extend.none)
+            supLevels.remove(i)
+if resLevels.size() > 0
+    for i = resLevels.size() - 1 to 0
+        lv = resLevels.get(i)
+        if close > lv.top
+            lv.zone.set_right(bar_index)
+            lv.zone.set_extend(extend.none)
+            resLevels.remove(i)
+
+// =============================================================================
+//  9. INFO TABLE (bottom-right, so it doesn't cover the PA table)
+// =============================================================================
+var table info = table.new(position.bottom_right, 2, 7, bgcolor = color.new(color.black, 25), border_width = 1, border_color = color.new(BUY_COL, 50))
+
+if showTable and barstate.islast
+    trendTxt = badTF ? "⚠ Trend TF must be higher than chart" : trendUp ? "BULLISH ▲ (buys only)" : trendDown ? "BEARISH ▼ (sells only)" : "NEUTRAL"
+    trendCol = badTF ? color.orange : trendUp ? BUY_COL : trendDown ? SELL_COL : color.gray
+    sigCol   = str.contains(lastName, "BUY") ? BUY_COL : str.contains(lastName, "SELL") ? SELL_COL : color.gray
+    info.cell(0, 0, "MY Setup", text_color = color.white, text_size = size.small, text_halign = text.align_left)
+    info.cell(1, 0, syminfo.ticker + " · " + f_tfLabel(timeframe.period), text_color = color.white, text_size = size.small)
+    info.cell(0, 1, "Trend (" + f_tfLabel(trendTF) + ")", text_color = color.white, text_size = size.small, text_halign = text.align_left)
+    info.cell(1, 1, trendTxt, text_color = trendCol, text_size = size.small)
+    info.cell(0, 2, "Last signal", text_color = color.white, text_size = size.small, text_halign = text.align_left)
+    info.cell(1, 2, lastName == "None yet" ? lastName : "MY: " + lastName, text_color = sigCol, text_size = size.small)
+    info.cell(0, 3, "Entry", text_color = color.white, text_size = size.small, text_halign = text.align_left)
+    info.cell(1, 3, na(lastEntry) ? "-" : f_fmt(lastEntry), text_color = color.white, text_size = size.small)
+    info.cell(0, 4, "SL / TP", text_color = color.white, text_size = size.small, text_halign = text.align_left)
+    info.cell(1, 4, na(lastSL) ? "-" : f_fmt(lastSL) + " / " + f_fmt(lastTP), text_color = color.white, text_size = size.small)
+    info.cell(0, 5, "Time", text_color = color.white, text_size = size.small, text_halign = text.align_left)
+    info.cell(1, 5, na(lastTime) ? "-" : str.format_time(lastTime, "dd MMM yyyy HH:mm", syminfo.timezone), text_color = color.white, text_size = size.small)
+    info.cell(0, 6, "Pip size", text_color = color.white, text_size = size.small, text_halign = text.align_left)
+    info.cell(1, 6, str.tostring(pip), text_color = color.white, text_size = size.small)
+
+// =============================================================================
+//  10. ALERTS  (Create Alert -> Condition: MY Setup -> "Any alert() function call")
+// =============================================================================
+if buySignal
+    alert("MY: " + f_setupName(bosBuy, bounceBuy, "BUY") + " " + syminfo.ticker + " (" + f_tfLabel(timeframe.period) + ") | Entry: " + f_fmt(buyEntry) + " | SL: " + f_fmt(buySL) + " | TP: " + f_fmt(buyTP) + " | Risk: " + str.tostring((buyEntry - buySL) / pip, "#.#") + " pips", alert.freq_once_per_bar_close)
+if sellSignal
+    alert("MY: " + f_setupName(bosSell, bounceSell, "SELL") + " " + syminfo.ticker + " (" + f_tfLabel(timeframe.period) + ") | Entry: " + f_fmt(sellEntry) + " | SL: " + f_fmt(sellSL) + " | TP: " + f_fmt(sellTP) + " | Risk: " + str.tostring((sellSL - sellEntry) / pip, "#.#") + " pips", alert.freq_once_per_bar_close)

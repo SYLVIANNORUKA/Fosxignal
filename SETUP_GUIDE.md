@@ -134,3 +134,87 @@ To hide those numbers: gear icon on PA Strategy → **Style** tab → untick **Q
 - Don't keep tweaking settings until the results look perfect. That's "curve fitting", and it usually fails live.
 - The strategy ignores new signals while a trade is open. The indicator still shows them, so you may see a few more signals than trades.
 - **Past results don't guarantee future results.** Forward-test on a **demo account** for a few weeks before risking real money.
+
+---
+
+# MY Setup: Beginner Setup Guide
+
+These are two more scripts for **your own setup**. They are separate from the PA Signals scripts, so you can use either one or both on the same chart.
+
+| File | What it is | Use it for |
+|---|---|---|
+| `MY_Setup_Indicator.pine` | **Indicator**: shows signals and sends alerts, never trades | Everyday live use |
+| `MY_Setup_Strategy.pine` | **Strategy**: the same logic, simulating trades at 1% risk | Backtesting in the Strategy Tester |
+
+## The four setups
+
+First, the script finds **levels**. A level is two swing lows at about the same price (a **double bottom**, drawn as a blue dashed box) or two swing highs at about the same price (a **double top**, drawn as an orange dashed box). "About the same price" means within the **Equal level tolerance**, which is 3 pips by default.
+
+| Setup | When it signals |
+|---|---|
+| **1. BOS SELL** | The 4H trend is down, and a strong bearish candle closes **below** a double bottom. "Strong" means the body is at least 50% of the candle |
+| **2. BOS BUY** | The 4H trend is up, and a strong bullish candle closes **above** a double top |
+| **3. BOUNCE BUY** | The 4H trend is up, price comes back down to a double bottom, and a bullish pin bar or engulfing candle closes back **above** it |
+| **4. BOUNCE SELL** | The 4H trend is down, price comes back up to a double top, and a bearish pin bar or engulfing candle closes back **below** it |
+
+Other rules:
+
+- **Trend:** buys only in an uptrend, sells only in a downtrend.
+- **Stop-loss:** 2 pips beyond the signal candle's wick. For an engulfing, it uses the wick of both candles.
+- **Take-profit:** 2 × the risk (1:2).
+- **Cooldown:** at least 3 candles between signals.
+- **Switching setups off:** each setup has its own on/off switch in the settings (gear icon → **Setups**).
+- **When a level stops counting:** once price **closes** through a level, it is used up. Its box stops extending to the right.
+
+## How to tell MY signals from PA signals
+
+| | PA Signals | MY Setup |
+|---|---|---|
+| Label text | `BUY (Pin Bar)` | `MY: BOUNCE BUY`, `MY: BOS SELL` … |
+| Label colours | Green (buy) / red (sell) | **Blue** (buy) / **orange** (sell) |
+| Label position | Above or below the candle | At the **stop-loss price** |
+| Marker | Triangles | **Diamonds** |
+| SL / TP lines | Solid | **Dashed** |
+| Info table | Top-right | **Bottom-right** (also shows the pip size) |
+
+## 1. Paste the scripts into TradingView
+
+These are the same steps as for PA Signals (section 1 above):
+
+1. Open the **Pine Editor** and choose **Create new → Indicator**.
+2. Select everything and delete it.
+3. Paste `MY_Setup_Indicator.pine`.
+4. Click **Save** with the name `MY Setup`, then **Add to chart**.
+5. Repeat with **Create new → Strategy** and `MY_Setup_Strategy.pine`, saved as `MY Strategy`.
+
+If red error text appears at the bottom of the editor, copy it and send it to me.
+
+## 2. Use it on a chart
+
+- Open your pair on **15m** or **1h**, then go to **Indicators → My scripts → MY Setup**.
+- The levels need a few candles to appear. Each swing is only confirmed **5 candles later** (the "Swing lookback" setting), so a new double bottom shows up 5 candles after its second low. This is normal, and it's what stops signals from repainting.
+- Check the table in the bottom-right. **Pip size** should be **0.0001**, or **0.01** on JPY pairs.
+- To see more levels (and signals), raise **Equal level tolerance** (for example to 5 pips) or lower **Swing lookback** (for example to 3). To see fewer but cleaner ones, do the opposite.
+
+## 3. Alerts on your phone
+
+These are the same steps as section 3 above, with one difference: under **Condition**, choose **MY Setup**, then **Any alert() function call**. Choose **Once per bar close** as the trigger, and tick **Notify in app**.
+
+Example alert message:
+
+```
+MY: BOUNCE BUY EURUSD (15m) | Entry: 1.08452 | SL: 1.08311 | TP: 1.08734 | Risk: 14.1 pips
+```
+
+The MY alerts are separate from the PA alerts. To receive both, create one alert for each.
+
+## 4. Backtest with MY Strategy
+
+- Add **MY Strategy** to the chart and open the **Strategy Tester** tab. Read the results the same way as section 4 above.
+- The cost settings are the same as PA Strategy:
+  - risk of 1% per trade
+  - commission of 0.004% (about 1 pip of spread)
+  - slippage of 0
+  - $10,000 starting balance
+- To compare the two strategies fairly, keep those settings the same and test the same pairs and dates.
+- **To see which setup works best**, switch the setups on and off one at a time (gear icon → **Setups**) and compare the results. The **List of Trades** tab also shows each trade's setup name, for example `MY: BOS SELL`.

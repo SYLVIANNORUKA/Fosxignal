@@ -1,0 +1,310 @@
+//@version=6
+// =============================================================================
+//  MY SETUP  [BOS + Double Top/Bottom, HTF Trend]  —  STRATEGY
+// -----------------------------------------------------------------------------
+//  BACKTEST VERSION of the "MY Setup" indicator. Same signal logic, but it
+//  simulates trades so you can see results in TradingView's Strategy Tester.
+//
+//  • Risks a fixed % of equity per trade (default 1%).
+//    Position size = (equity x risk %) / (distance to stop-loss in money).
+//  • Enters at the close of the signal candle (same price the indicator shows).
+//  • Exits ONLY at the stop-loss or take-profit.
+//  • One trade at a time: new signals are ignored while a trade is open.
+//
+//  This is a SIMULATION for testing. It cannot place real trades and is not
+//  connected to any broker unless you connect one yourself.
+// =============================================================================
+// Same cost settings as PA_Signals_Strategy.pine:
+// process_orders_on_close = true -> entries fill at the signal candle's close
+// slippage = 0                   -> slippage is counted in TICKS, which differ between
+//                                   feeds, so the spread is modelled as commission instead:
+// commission 0.004% per side     -> about 1 pip round-trip on major pairs, on ANY feed
+// margin 3%                      -> about 1:33 leverage, typical for retail forex
+//                                   (if you change it, also change MARGIN_PCT below)
+strategy("MY Setup [BOS + Double Top/Bottom] - Strategy", shorttitle = "MY Strategy", overlay = true,
+     initial_capital = 10000, currency = currency.USD,
+     default_qty_type = strategy.fixed, default_qty_value = 1, pyramiding = 0,
+     process_orders_on_close = true, slippage = 0,
+     commission_type = strategy.commission.percent, commission_value = 0.004,
+     margin_long = 3, margin_short = 3,
+     max_labels_count = 500, max_lines_count = 500, max_boxes_count = 500)
+
+// =============================================================================
+//  1. SETTINGS
+// =============================================================================
+const string GRP_TREND = "1) Trend filter"
+const string GRP_LVL   = "2) Swing levels (double tops / bottoms)"
+const string GRP_SET   = "3) Setups (on / off)"
+const string GRP_PAT   = "4) Candle rules"
+const string GRP_RISK  = "5) Stop-loss / Take-profit / Risk"
+const string GRP_VIS   = "6) Display"
+
+// --- Trend filter ---
+emaLen  = input.int(50, "EMA length", minval = 1, group = GRP_TREND)
+trendTF = input.timeframe("240", "Trend timeframe", group = GRP_TREND,
+     tooltip = "Timeframe used for the trend filter. 240 = 4 hours. Must be HIGHER than your chart timeframe.")
+
+// --- Levels ---
+swingLen  = input.int(5, "Swing lookback (bars each side)", minval = 1, group = GRP_LVL,
+     tooltip = "A swing low/high must be the lowest/highest candle with this many bars on BOTH sides.")
+eqTolPips = input.float(3.0, "Equal level tolerance (pips)", minval = 0, step = 0.5, group = GRP_LVL,
+     tooltip = "Two swing lows (or highs) this close together form a level. Also how close price must come back to a level for a Bounce.")
+swingMem  = input.int(10, "Swings remembered (each side)", minval = 2, maxval = 50, group = GRP_LVL,
+     tooltip = "A new swing is compared with this many earlier swings to find its 'equal' partner.")
+maxLevels = input.int(5, "Levels to keep (each side)", minval = 1, maxval = 20, group = GRP_LVL)
+
+// --- Setups ---
+useBosSell    = input.bool(true, "Setup 1: BOS SELL", group = GRP_SET)
+useBosBuy     = input.bool(true, "Setup 2: BOS BUY", group = GRP_SET)
+useBounceBuy  = input.bool(true, "Setup 3: BOUNCE BUY (double bottom)", group = GRP_SET)
+useBounceSell = input.bool(true, "Setup 4: BOUNCE SELL (double top)", group = GRP_SET)
+
+// --- Candle rules ---
+bodyPct  = input.float(50, "BOS: min body % of candle", minval = 10, maxval = 100, step = 5, group = GRP_PAT,
+     tooltip = "The breakout candle's body must be at least this % of its whole high-to-low range.")
+pinRatio = input.float(2.0, "Pin bar: min wick / body ratio", minval = 1.0, step = 0.5, group = GRP_PAT)
+pinNose  = input.float(60, "Pin bar: min wick % of candle", minval = 50, maxval = 95, group = GRP_PAT)
+
+// --- Risk ---
+rrRatio     = input.float(2.0, "Risk : Reward (TP = risk x this)", minval = 2.0, step = 0.5, group = GRP_RISK,
+     tooltip = "2 means the take-profit is twice as far as the stop-loss (1:2). Minimum is 2.")
+slPips      = input.float(2.0, "SL buffer beyond wick (pips)", minval = 0, step = 0.5, group = GRP_RISK)
+pipOverride = input.float(0, "Pip size override (0 = auto)", minval = 0, step = 0.0001, group = GRP_RISK,
+     tooltip = "Leave at 0. Auto uses 0.0001 for forex pairs and 0.01 for JPY pairs.")
+cooldown    = input.int(3, "Min bars between signals", minval = 0, group = GRP_RISK)
+riskPct     = input.float(1.0, "Risk per trade (% of equity)", minval = 0.1, maxval = 10, step = 0.1, group = GRP_RISK)
+
+// --- Display ---
+showLevels = input.bool(true, "Show levels", group = GRP_VIS)
+showEma    = input.bool(true, "Show trend EMA", group = GRP_VIS)
+showLabels = input.bool(true, "Show MY labels", group = GRP_VIS)
+showLines  = input.bool(true, "Show SL/TP lines", group = GRP_VIS)
+lineLen    = input.int(20, "SL/TP line length (bars)", minval = 1, maxval = 500, group = GRP_VIS)
+
+color BUY_COL  = #2962ff   // blue
+color SELL_COL = #ff6d00   // orange
+
+// =============================================================================
+//  2. HELPERS
+// =============================================================================
+// One pip: 0.01 for JPY-quoted pairs, 0.0001 for other forex pairs, 10 ticks otherwise.
+f_pipSize() =>
+    syminfo.type == "forex" ? (syminfo.currency == "JPY" ? 0.01 : 0.0001) : syminfo.mintick * 10
+pip = pipOverride > 0 ? pipOverride : f_pipSize()
+tol = eqTolPips * pip
+
+// Must match margin_long / margin_short in the strategy() line above.
+const float MARGIN_PCT = 3.0
+
+f_fmt(float x) => str.tostring(x, format.mintick)
+
+f_setupName(bool bos, bool bounce, string side) =>
+    bos and bounce ? "BOS + BOUNCE " + side : bos ? "BOS " + side : "BOUNCE " + side
+
+// Exchange rate from the pair's quote currency to the account currency (USD),
+// so the 1% risk is correct on every pair.
+fxRate = request.currency_rate(syminfo.currency, strategy.account_currency)
+
+// Position size (in units) that loses riskPct % of equity if the stop is hit.
+// Example: $10,000 equity, 1% = $100. Stop 20 pips on EURUSD = $0.0020 per unit
+// -> 100 / 0.0020 = 50,000 units (0.5 lot).
+// NOTE: numbers TradingView prints next to trades on the chart are this SIZE IN
+// UNITS, not dollars of profit. Profit is in "List of Trades".
+f_qty(float entry, float sl) =>
+    float lossPerUnit = math.abs(entry - sl) * syminfo.pointvalue * fxRate
+    float riskCash    = strategy.equity * riskPct / 100
+    float riskQty     = lossPerUnit > 0 ? riskCash / lossPerUnit : 0.0
+    // Cap at 90% of available margin so very tight stops can't trigger a "Margin call".
+    float maxQty      = strategy.equity * 0.9 / (entry * syminfo.pointvalue * fxRate * MARGIN_PCT / 100)
+    math.floor(math.min(riskQty, maxQty))
+
+f_size(float qty) =>
+    str.tostring(qty, "#,###") + " units" + (syminfo.type == "forex" ? " (" + str.tostring(qty / 100000, "#.##") + " lot)" : "")
+
+// =============================================================================
+//  3. HIGHER-TIMEFRAME TREND
+// =============================================================================
+// [1] + lookahead_on = use the last CLOSED higher-timeframe candle -> no repainting.
+[htfClose, htfEma] = request.security(syminfo.tickerid, trendTF, [close[1], ta.ema(close, emaLen)[1]], lookahead = barmerge.lookahead_on)
+trendUp   = htfClose > htfEma
+trendDown = htfClose < htfEma
+
+// =============================================================================
+//  4. LEVELS = DOUBLE BOTTOMS (equal swing lows) / DOUBLE TOPS (equal swing highs)
+// =============================================================================
+type Level
+    float top
+    float bottom
+    box   zone
+
+var array<Level> supLevels  = array.new<Level>()
+var array<Level> resLevels  = array.new<Level>()
+var array<float> swLows     = array.new<float>()
+var array<int>   swLowBars  = array.new<int>()
+var array<float> swHighs    = array.new<float>()
+var array<int>   swHighBars = array.new<int>()
+
+supBg = color.new(BUY_COL, showLevels ? 80 : 100)
+supBd = color.new(BUY_COL, showLevels ? 20 : 100)
+resBg = color.new(SELL_COL, showLevels ? 80 : 100)
+resBd = color.new(SELL_COL, showLevels ? 20 : 100)
+
+pl = ta.pivotlow(low, swingLen, swingLen)
+ph = ta.pivothigh(high, swingLen, swingLen)
+
+if not na(pl)
+    bool known = false
+    for lv in supLevels
+        if pl >= lv.bottom - tol and pl <= lv.top + tol
+            known := true
+    if not known and swLows.size() > 0
+        for i = swLows.size() - 1 to 0
+            prevLow = swLows.get(i)
+            if math.abs(pl - prevLow) <= tol
+                lvBottom = math.min(pl, prevLow)
+                lvTop    = math.max(pl, prevLow)
+                if close >= lvBottom
+                    supLevels.push(Level.new(lvTop, lvBottom, box.new(swLowBars.get(i), lvTop, bar_index, lvBottom, border_color = supBd, border_style = line.style_dashed, bgcolor = supBg, extend = extend.right)))
+                    if supLevels.size() > maxLevels
+                        supLevels.shift().zone.delete()
+                break
+            if prevLow < pl - tol
+                break
+    swLows.push(pl)
+    swLowBars.push(bar_index - swingLen)
+    if swLows.size() > swingMem
+        swLows.shift()
+        swLowBars.shift()
+
+if not na(ph)
+    bool known = false
+    for lv in resLevels
+        if ph >= lv.bottom - tol and ph <= lv.top + tol
+            known := true
+    if not known and swHighs.size() > 0
+        for i = swHighs.size() - 1 to 0
+            prevHigh = swHighs.get(i)
+            if math.abs(ph - prevHigh) <= tol
+                lvBottom = math.min(ph, prevHigh)
+                lvTop    = math.max(ph, prevHigh)
+                if close <= lvTop
+                    resLevels.push(Level.new(lvTop, lvBottom, box.new(swHighBars.get(i), lvTop, bar_index, lvBottom, border_color = resBd, border_style = line.style_dashed, bgcolor = resBg, extend = extend.right)))
+                    if resLevels.size() > maxLevels
+                        resLevels.shift().zone.delete()
+                break
+            if prevHigh > ph + tol
+                break
+    swHighs.push(ph)
+    swHighBars.push(bar_index - swingLen)
+    if swHighs.size() > swingMem
+        swHighs.shift()
+        swHighBars.shift()
+
+// =============================================================================
+//  5. CANDLES
+// =============================================================================
+body     = math.abs(close - open)
+rng      = high - low
+upWick   = high - math.max(open, close)
+dnWick   = math.min(open, close) - low
+prevBody = math.abs(close[1] - open[1])
+
+strongBull = rng > 0 and close > open and body >= rng * bodyPct / 100
+strongBear = rng > 0 and close < open and body >= rng * bodyPct / 100
+
+bullEngulf = close > open and close[1] < open[1] and close >= open[1] and open <= close[1] and body > prevBody
+bearEngulf = close < open and close[1] > open[1] and close <= open[1] and open >= close[1] and body > prevBody
+bullPin    = rng > 0 and dnWick >= pinRatio * body and dnWick >= rng * pinNose / 100 and upWick <= rng * 0.25
+bearPin    = rng > 0 and upWick >= pinRatio * body and upWick >= rng * pinNose / 100 and dnWick <= rng * 0.25
+
+bullPatLow  = bullEngulf ? math.min(low, low[1]) : low
+bearPatHigh = bearEngulf ? math.max(high, high[1]) : high
+
+// =============================================================================
+//  6. SETUPS (identical to the indicator)
+// =============================================================================
+bool brokeSupport = false
+bool bounceSupport = false
+for lv in supLevels
+    if close < lv.bottom
+        brokeSupport := true
+    if bullPatLow >= lv.bottom - tol and bullPatLow <= lv.top + tol and close > lv.top
+        bounceSupport := true
+
+bool brokeResistance = false
+bool bounceResistance = false
+for lv in resLevels
+    if close > lv.top
+        brokeResistance := true
+    if bearPatHigh <= lv.top + tol and bearPatHigh >= lv.bottom - tol and close < lv.bottom
+        bounceResistance := true
+
+bosSell    = useBosSell and trendDown and strongBear and brokeSupport
+bosBuy     = useBosBuy and trendUp and strongBull and brokeResistance
+bounceBuy  = useBounceBuy and trendUp and (bullPin or bullEngulf) and bounceSupport
+bounceSell = useBounceSell and trendDown and (bearPin or bearEngulf) and bounceResistance
+
+buyEntry  = close
+buySL     = (bounceBuy ? bullPatLow : low) - slPips * pip
+buyTP     = buyEntry + (buyEntry - buySL) * rrRatio
+sellEntry = close
+sellSL    = (bounceSell ? bearPatHigh : high) + slPips * pip
+sellTP    = sellEntry - (sellSL - sellEntry) * rrRatio
+
+var int lastSigBar = na
+cooldownOk = na(lastSigBar) or bar_index - lastSigBar > cooldown
+
+buySignal  = barstate.isconfirmed and cooldownOk and (bosBuy or bounceBuy) and buyEntry > buySL
+sellSignal = barstate.isconfirmed and cooldownOk and (bosSell or bounceSell) and sellEntry < sellSL
+
+if buySignal or sellSignal
+    lastSigBar := bar_index
+
+// =============================================================================
+//  7. SIMULATED TRADES (backtest only)
+// =============================================================================
+flat = strategy.position_size == 0
+
+if buySignal and flat
+    qty = f_qty(buyEntry, buySL)
+    if qty > 0
+        name = f_setupName(bosBuy, bounceBuy, "BUY")
+        strategy.entry("MY Long", strategy.long, qty = qty, comment = "MY: " + name)
+        strategy.exit("MY Long exit", "MY Long", stop = buySL, limit = buyTP, comment_loss = "SL", comment_profit = "TP")
+        if showLabels
+            label.new(bar_index, buySL, "MY: " + name + "\nEntry: " + f_fmt(buyEntry) + "\nSL: " + f_fmt(buySL) + "\nTP: " + f_fmt(buyTP) + "\nRisk: " + str.tostring((buyEntry - buySL) / pip, "#.#") + " pips = $" + str.tostring(qty * (buyEntry - buySL) * syminfo.pointvalue * fxRate, "#.##") + "\nSize: " + f_size(qty), yloc = yloc.price, style = label.style_label_up, color = BUY_COL, textcolor = color.white, size = size.small)
+        if showLines
+            line.new(bar_index, buySL, bar_index + lineLen, buySL, color = color.red, style = line.style_dashed, width = 2)
+            line.new(bar_index, buyTP, bar_index + lineLen, buyTP, color = color.lime, style = line.style_dashed, width = 2)
+
+if sellSignal and flat
+    qty = f_qty(sellEntry, sellSL)
+    if qty > 0
+        name = f_setupName(bosSell, bounceSell, "SELL")
+        strategy.entry("MY Short", strategy.short, qty = qty, comment = "MY: " + name)
+        strategy.exit("MY Short exit", "MY Short", stop = sellSL, limit = sellTP, comment_loss = "SL", comment_profit = "TP")
+        if showLabels
+            label.new(bar_index, sellSL, "MY: " + name + "\nEntry: " + f_fmt(sellEntry) + "\nSL: " + f_fmt(sellSL) + "\nTP: " + f_fmt(sellTP) + "\nRisk: " + str.tostring((sellSL - sellEntry) / pip, "#.#") + " pips = $" + str.tostring(qty * (sellSL - sellEntry) * syminfo.pointvalue * fxRate, "#.##") + "\nSize: " + f_size(qty), yloc = yloc.price, style = label.style_label_down, color = SELL_COL, textcolor = color.white, size = size.small)
+        if showLines
+            line.new(bar_index, sellSL, bar_index + lineLen, sellSL, color = color.red, style = line.style_dashed, width = 2)
+            line.new(bar_index, sellTP, bar_index + lineLen, sellTP, color = color.lime, style = line.style_dashed, width = 2)
+
+plot(showEma ? htfEma : na, "MY trend EMA", color = trendUp ? BUY_COL : SELL_COL, linewidth = 2, style = plot.style_stepline)
+
+// =============================================================================
+//  8. REMOVE BROKEN LEVELS
+// =============================================================================
+if supLevels.size() > 0
+    for i = supLevels.size() - 1 to 0
+        lv = supLevels.get(i)
+        if close < lv.bottom
+            lv.zone.set_right(bar_index)
+            lv.zone.set_extend(extend.none)
+            supLevels.remove(i)
+if resLevels.size() > 0
+    for i = resLevels.size() - 1 to 0
+        lv = resLevels.get(i)
+        if close > lv.top
+            lv.zone.set_right(bar_index)
+            lv.zone.set_extend(extend.none)
+            resLevels.remove(i)
